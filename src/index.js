@@ -102,8 +102,8 @@ async function getZohoAccessToken(env) {
   const now = Date.now();
 
   // 1) KV cache (shared across isolates)
-  if (env.TOKEN_KV) {
-    const raw = await env.TOKEN_KV.get("zoho_token", { type: "json" });
+  if (env.coastalsource_kv) {
+    const raw = await env.coastalsource_kv.get("zoho_token", { type: "json" });
     if (raw?.access_token && raw?.exp_ms && now < raw.exp_ms - 30_000) {
       return raw.access_token;
     }
@@ -135,8 +135,8 @@ async function getZohoAccessToken(env) {
   const expiresInSec = Number(data.expires_in) || 3600;
   const expMs = now + expiresInSec * 1000;
 
-  if (env.TOKEN_KV) {
-    await env.TOKEN_KV.put("zoho_token", JSON.stringify({ access_token: data.access_token, exp_ms: expMs }), {
+  if (env.coastalsource_kv) {
+    await env.coastalsource_kv.put("zoho_token", JSON.stringify({ access_token: data.access_token, exp_ms: expMs }), {
       expirationTtl: expiresInSec,
     });
   } else {
@@ -150,7 +150,7 @@ async function getZohoAccessToken(env) {
 async function clearCachedToken(env) {
   memoryToken = null;
   memoryTokenExpMs = 0;
-  if (env.TOKEN_KV) {
-    await env.TOKEN_KV.delete("zoho_token");
+  if (env.coastalsource_kv) {
+    await env.coastalsource_kv.delete("zoho_token");
   }
 }
