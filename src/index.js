@@ -125,6 +125,7 @@ async function handleLookupByPhone(request, env, ctx, url) {
           email: contact.Email ?? null,
           phone: contact.Phone ?? null,
           mobile: contact.Mobile ?? null,
+          rep: contact.Rep ?? null,
           account_id: accountId,
           account_name: contact?.Account_Name?.name ?? null,
           owner_name: contact?.Owner?.name ?? null,
@@ -215,6 +216,7 @@ async function tryFindContactByPhone(token, phoneCandidate) {
       website: record.Website ?? null,
 
       // customer-requested fields
+      compass_id: record.Compass_ID ?? null,
       account_type: record.Account_Type ?? null,
       dealer_tier: record.Dealer_Tier ?? null,
       kam_owner: record.KAM_Owner ?? null,
