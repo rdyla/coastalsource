@@ -2,43 +2,149 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Only allow /zoho/* routes
-    if (!url.pathname.startsWith("/zoho/")) {
-      return json({ error: "Not Found" }, 404);
-    }
-
-    // Only allow GET for now
-    if (request.method !== "GET") {
-      return json({ error: "Method Not Allowed" }, 405);
-    }
-
-    // API key auth (applies to all /zoho/* routes)
-    const authErr = requireApiKey(request, env);
-    if (authErr) return authErr;
-
-    // Router table
-    const routes = {
-      "/zoho/leads": handleLeads,
-      "/zoho/account-summary": handleAccountSummary,
-      "/zoho/lookup-by-phone": handleLookupByPhone,
-      // add more here:
-      // "/zoho/contacts": handleContacts,
-      // "/zoho/lookup": handleLookup,
-    };
-
-    const handler = routes[url.pathname];
-    if (!handler) return json({ error: "Not Found" }, 404);
-
     try {
-      return await handler(request, env, ctx, url);
+      if (url.pathname.startsWith("/zoho/")) {
+        return await handleZohoRoutes(request, env, ctx, url);
+      }
+      if (url.pathname.startsWith("/zoom/")) {
+        return await handleZoomRoutes(request, env, ctx, url);
+      }
+      return json({ error: "Not Found" }, 404);
     } catch (err) {
       if (err?.details && err?.status) {
-        return json({ error: "Zoho request failed", details: err.details }, err.status);
+        return json({ error: "Upstream request failed", details: err.details }, err.status);
       }
       return json({ error: "Worker error", message: String(err?.message || err) }, 500);
     }
   },
 };
+
+/* -----------------------------
+ * Zoho route dispatcher
+ * ----------------------------- */
+
+async function handleZohoRoutes(request, env, ctx, url) {
+  if (request.method !== "GET") {
+    return json({ error: "Method Not Allowed" }, 405);
+  }
+
+  const authErr = requireApiKey(request, env);
+  if (authErr) return authErr;
+
+  const routes = {
+    "/zoho/leads": handleLeads,
+    "/zoho/account-summary": handleAccountSummary,
+    "/zoho/lookup-by-phone": handleLookupByPhone,
+  };
+
+  const handler = routes[url.pathname];
+  if (!handler) return json({ error: "Not Found" }, 404);
+
+  return handler(request, env, ctx, url);
+}
+
+/* -----------------------------
+ * Zoom route dispatcher
+ * ----------------------------- */
+
+async function handleZoomRoutes(request, env, ctx, url) {
+  // Webhook catcher — Zoom POSTs here. Unauthenticated for now so we can
+  // observe what headers Zoom actually sends; lock down once known.
+  if (url.pathname === "/zoom/engagement-webhook" && request.method === "POST") {
+    return handleWebhookCatch(request, env, ctx, url);
+  }
+
+  // Inspection endpoints require the same x-api-key as /zoho/*
+  const authErr = requireApiKey(request, env);
+  if (authErr) return authErr;
+
+  if (url.pathname === "/zoom/webhooks/recent" && request.method === "GET") {
+    return handleWebhooksRecent(request, env);
+  }
+
+  const idMatch = url.pathname.match(/^\/zoom\/webhooks\/([^/]+)$/);
+  if (idMatch) {
+    const id = decodeURIComponent(idMatch[1]);
+    if (request.method === "GET") return handleWebhookGet(env, id);
+    if (request.method === "DELETE") return handleWebhookDelete(env, id);
+  }
+
+  return json({ error: "Not Found" }, 404);
+}
+
+/* -----------------------------
+ * Webhook catcher + inspection
+ * ----------------------------- */
+
+async function handleWebhookCatch(request, env, ctx, url) {
+  const rawBody = await request.text();
+
+  let parsedBody = null;
+  try {
+    parsedBody = rawBody ? JSON.parse(rawBody) : null;
+  } catch {
+    parsedBody = null;
+  }
+
+  const headers = {};
+  for (const [k, v] of request.headers.entries()) headers[k] = v;
+
+  const query = {};
+  for (const [k, v] of url.searchParams.entries()) query[k] = v;
+
+  const receivedAt = new Date().toISOString();
+  const id = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+
+  const record = {
+    id,
+    received_at: receivedAt,
+    method: request.method,
+    path: url.pathname,
+    query,
+    headers,
+    raw_body: rawBody,
+    parsed_body: parsedBody,
+  };
+
+  console.log("Zoom webhook received:", JSON.stringify(record));
+
+  if (env.coastalsource_kv) {
+    await env.coastalsource_kv.put(`webhook:${id}`, JSON.stringify(record), {
+      expirationTtl: 60 * 60 * 24 * 7, // 7 days
+    });
+  }
+
+  // Ack quickly so Zoom doesn't retry
+  return json({ ok: true, id });
+}
+
+async function handleWebhooksRecent(request, env) {
+  if (!env.coastalsource_kv) {
+    return json({ error: "KV not bound" }, 500);
+  }
+
+  const list = await env.coastalsource_kv.list({ prefix: "webhook:", limit: 100 });
+  const keys = list.keys.map((k) => k.name).sort().reverse().slice(0, 20);
+
+  const records = await Promise.all(
+    keys.map((k) => env.coastalsource_kv.get(k, { type: "json" }))
+  );
+
+  return json({ count: records.length, webhooks: records.filter(Boolean) });
+}
+
+async function handleWebhookGet(env, id) {
+  if (!env.coastalsource_kv) return json({ error: "KV not bound" }, 500);
+  const record = await env.coastalsource_kv.get(`webhook:${id}`, { type: "json" });
+  if (!record) return json({ error: "Not Found" }, 404);
+  return json(record);
+}
+
+async function handleWebhookDelete(env, id) {
+  if (!env.coastalsource_kv) return json({ error: "KV not bound" }, 500);
+  await env.coastalsource_kv.delete(`webhook:${id}`);
+  return json({ ok: true, deleted: id });
+}
 
 /* -----------------------------
  * Route Handlers: Leads
