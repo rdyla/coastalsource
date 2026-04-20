@@ -2,6 +2,7 @@ name = "coastalsource"
 main = "src/index.js"
 compatibility_date = "2024-12-01"
 workers_dev = true
+account_id = "521c322a89a17bb69f91f1e65177606e"
 
 [[kv_namespaces]]
 binding = "coastalsource_kv"
