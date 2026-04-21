@@ -224,7 +224,8 @@ async function processEngagementWebhook(env, data) {
       }
 
       // Build proposed Zoho Desk ticket payload (dry-run — not dispatched).
-      if (env.ZOHO_DESK_DEFAULT_DEPARTMENT_ID) {
+      const departmentId = pickDeskDepartmentId(env, engagementDetails);
+      if (departmentId) {
         try {
           const zohoToken = await getZohoAccessToken(env);
           deskContactFound = await findZohoDeskContactByPhone(env, zohoToken, callerPhone);
@@ -233,12 +234,14 @@ async function processEngagementWebhook(env, data) {
             engagementDetails,
             phoneLookup: phoneLookupResult,
             deskContact: deskContactFound,
-            departmentId: env.ZOHO_DESK_DEFAULT_DEPARTMENT_ID,
+            departmentId,
           });
         } catch (err) {
           deskTicketError = String(err?.message || err);
           console.log("Desk ticket payload build failed:", deskTicketError);
         }
+      } else {
+        deskTicketError = "no department mapping for queue/flow";
       }
     }
 
@@ -1129,6 +1132,20 @@ function splitName(fullName) {
   if (parts.length === 0) return { firstName: "", lastName: "Unknown Caller" };
   if (parts.length === 1) return { firstName: "", lastName: parts[0] };
   return { firstName: parts[0], lastName: parts.slice(1).join(" ") };
+}
+
+function pickDeskDepartmentId(env, engagementDetails) {
+  const queueName = engagementDetails?.queues?.[0]?.queue_name || "";
+  const flowName = engagementDetails?.flows?.[0]?.flow_name || "";
+  const haystack = `${queueName} ${flowName}`.toLowerCase();
+
+  if (haystack.includes("technical") && env.ZOHO_DESK_DEPARTMENT_TECHNICAL_SUPPORT) {
+    return env.ZOHO_DESK_DEPARTMENT_TECHNICAL_SUPPORT;
+  }
+  if (haystack.includes("customer") && env.ZOHO_DESK_DEPARTMENT_CUSTOMER_SERVICE) {
+    return env.ZOHO_DESK_DEPARTMENT_CUSTOMER_SERVICE;
+  }
+  return env.ZOHO_DESK_DEFAULT_DEPARTMENT_ID || null;
 }
 
 function buildDeskTicketPayload({
