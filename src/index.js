@@ -74,6 +74,14 @@ async function handleZoomRoutes(request, env, ctx, url) {
     if (request.method === "DELETE") return handleWebhookDelete(env, id);
   }
 
+  const engagementProbeMatch = url.pathname.match(
+    /^\/zoom\/engagement\/([^/]+)\/probe$/
+  );
+  if (engagementProbeMatch && request.method === "GET") {
+    const engagementId = decodeURIComponent(engagementProbeMatch[1]);
+    return handleEngagementProbe(env, engagementId);
+  }
+
   const engagementMatch = url.pathname.match(/^\/zoom\/engagement\/([^/]+)$/);
   if (engagementMatch && request.method === "GET") {
     const engagementId = decodeURIComponent(engagementMatch[1]);
@@ -86,6 +94,45 @@ async function handleZoomRoutes(request, env, ctx, url) {
 async function handleEngagementFetch(env, engagementId) {
   const details = await fetchZoomEngagement(env, engagementId);
   return json(details);
+}
+
+async function handleEngagementProbe(env, engagementId) {
+  const token = await getZoomAccessToken(env);
+  const encoded = encodeURIComponent(engagementId);
+  const base = "https://api.zoom.us/v2/contact_center";
+
+  const paths = [
+    `/engagements/${encoded}`,
+    `/engagements/${encoded}?include=notes,disposition`,
+    `/engagements/${encoded}/notes`,
+    `/engagements/${encoded}/disposition`,
+    `/engagements/${encoded}/dispositions`,
+    `/engagements/${encoded}/transcript`,
+    `/engagements/${encoded}/transcripts`,
+    `/engagements/${encoded}/recordings`,
+    `/engagements/${encoded}/feedbacks`,
+    `/engagements/${encoded}/tags`,
+  ];
+
+  const results = {};
+  for (const p of paths) {
+    try {
+      const res = await fetch(base + p, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const text = await res.text();
+      let body = null;
+      try {
+        body = text ? JSON.parse(text) : text;
+      } catch {
+        body = text;
+      }
+      results[p] = { status: res.status, body };
+    } catch (err) {
+      results[p] = { error: String(err?.message || err) };
+    }
+  }
+  return json(results);
 }
 
 /* -----------------------------
