@@ -132,20 +132,52 @@ async function handleWebhookCatch(request, env, ctx, url) {
   const receivedAt = new Date().toISOString();
   const id = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
 
-  // If this is an engagement-ready event, fetch the engagement details
-  // from Zoom's API and attach them so we have one collated record.
+  const eventName = parsedBody?.event;
+  const engagementId = parsedBody?.payload?.object?.engagement_id;
+  const isEngagementReady =
+    eventName === "contact_center.cx_engagement_end_data_ready" && engagementId;
+
+  // Idempotency: if we've already processed this engagement_id, mark this
+  // webhook as a duplicate and skip the expensive downstream work.
+  let duplicateOf = null;
+  if (isEngagementReady && env.coastalsource_kv) {
+    duplicateOf = await env.coastalsource_kv.get(`engagement_seen:${engagementId}`);
+  }
+
   let engagementDetails = null;
   let engagementFetchError = null;
-  const engagementId = parsedBody?.payload?.object?.engagement_id;
-  if (
-    parsedBody?.event === "contact_center.cx_engagement_end_data_ready" &&
-    engagementId
-  ) {
+  let phoneLookupResult = null;
+  let zohoCreatePayload = null;
+  let zohoCreateDispatched = false;
+
+  if (isEngagementReady && !duplicateOf) {
     try {
       engagementDetails = await fetchZoomEngagement(env, engagementId);
     } catch (err) {
       engagementFetchError = String(err?.message || err);
       console.log("Zoom engagement fetch failed:", engagementFetchError);
+    }
+
+    const callerPhone = engagementDetails?.consumers?.[0]?.consumer_number || null;
+    if (callerPhone) {
+      try {
+        phoneLookupResult = await lookupZohoByPhone(env, callerPhone);
+        if (!phoneLookupResult.found) {
+          zohoCreatePayload = buildZohoContactCreatePayload({
+            phone: callerPhone,
+            engagementId,
+            receivedAt,
+          });
+        }
+      } catch (err) {
+        console.log("Zoho phone lookup failed:", String(err?.message || err));
+      }
+    }
+
+    if (env.coastalsource_kv) {
+      await env.coastalsource_kv.put(`engagement_seen:${engagementId}`, id, {
+        expirationTtl: 60 * 60 * 24 * 7,
+      });
     }
   }
 
@@ -158,8 +190,12 @@ async function handleWebhookCatch(request, env, ctx, url) {
     headers,
     raw_body: rawBody,
     parsed_body: parsedBody,
+    duplicate_of: duplicateOf,
     engagement_details: engagementDetails,
     engagement_fetch_error: engagementFetchError,
+    phone_lookup_result: phoneLookupResult,
+    zoho_create_payload: zohoCreatePayload,
+    zoho_create_dispatched: zohoCreateDispatched,
   };
 
   console.log("Zoom webhook received:", JSON.stringify(record));
@@ -170,8 +206,7 @@ async function handleWebhookCatch(request, env, ctx, url) {
     });
   }
 
-  // Ack quickly so Zoom doesn't retry
-  return json({ ok: true, id });
+  return json({ ok: true, id, duplicate_of: duplicateOf });
 }
 
 async function verifyZoomSignature(request, rawBody, env) {
@@ -303,27 +338,24 @@ async function handleLeads(request, env, ctx, url) {
 async function handleLookupByPhone(request, env, ctx, url) {
   const phoneRaw = url.searchParams.get("phone");
   if (!phoneRaw) return json({ error: "Missing query param", required: ["phone"] }, 400);
+  return json(await lookupZohoByPhone(env, phoneRaw));
+}
 
+async function lookupZohoByPhone(env, phoneRaw) {
   const accessToken = await getZohoAccessToken(env);
 
-  // Normalize: keep digits only
-  const digits = phoneRaw.replace(/\D/g, "");
+  const digits = String(phoneRaw).replace(/\D/g, "");
   const candidates = buildPhoneCandidates(digits);
 
-  // 1) Try Contacts first (most reliable for ANI -> person)
-  // We'll try multiple phone fields to improve hit rate.
   for (const p of candidates) {
-    const contact = await tryFindContactByPhone(accessToken, p);
+    const contact = await tryFindContactByPhone(env, accessToken, p);
     if (contact) {
-      // If contact links to an account, fetch account summary
       const accountId = contact?.Account_Name?.id || null;
-
       let accountSummary = null;
       if (accountId) {
-        accountSummary = await fetchAccountSummaryById(accessToken, accountId);
+        accountSummary = await fetchAccountSummaryById(env, accessToken, accountId);
       }
-
-      return json({
+      return {
         found: true,
         match_type: "contact",
         phone_normalized: p,
@@ -340,29 +372,27 @@ async function handleLookupByPhone(request, env, ctx, url) {
           modified_time: contact.Modified_Time ?? null,
         },
         account: accountSummary,
-      });
+      };
     }
   }
 
-  // 2) Fall back to Accounts by Phone
   for (const p of candidates) {
-    const account = await tryFindAccountByPhone(accessToken, p);
+    const account = await tryFindAccountByPhone(env, accessToken, p);
     if (account) {
-      return json({
+      return {
         found: true,
         match_type: "account",
         phone_normalized: p,
         contact: null,
         account: summarizeAccount(account),
-      });
+      };
     }
   }
 
-  return json({ found: false, match_type: null, contact: null, account: null });
+  return { found: false, match_type: null, contact: null, account: null };
+}
 
-  /* ---- inner helpers that can use env via closure ---- */
-
-async function tryFindContactByPhone(token, phoneCandidate) {
+async function tryFindContactByPhone(env, token, phoneCandidate) {
   const fieldsToTry = ["Phone", "Mobile", "Other_Phone"];
 
   for (const field of fieldsToTry) {
@@ -377,14 +407,12 @@ async function tryFindContactByPhone(token, phoneCandidate) {
         return zohoJson.data[0];
       }
     } catch (err) {
-      // If field isn't searchable, skip it and continue
       if (
         err?.details?.code === "INVALID_QUERY" &&
         err?.details?.details?.reason?.includes("field is not available for search")
       ) {
         continue;
       }
-      // Anything else is a real error
       throw err;
     }
   }
@@ -392,53 +420,65 @@ async function tryFindContactByPhone(token, phoneCandidate) {
   return null;
 }
 
-  async function tryFindAccountByPhone(token, phoneCandidate) {
-    const criteria = `(Phone:equals:${phoneCandidate})`;
-    const zohoUrl =
-      `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=` +
-      encodeURIComponent(criteria);
+async function tryFindAccountByPhone(env, token, phoneCandidate) {
+  const criteria = `(Phone:equals:${phoneCandidate})`;
+  const zohoUrl =
+    `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=` +
+    encodeURIComponent(criteria);
 
-    const zohoJson = await callZoho(env, token, zohoUrl);
-    if (Array.isArray(zohoJson.data) && zohoJson.data.length > 0) {
-      return zohoJson.data[0];
-    }
-    return null;
+  const zohoJson = await callZoho(env, token, zohoUrl);
+  if (Array.isArray(zohoJson.data) && zohoJson.data.length > 0) {
+    return zohoJson.data[0];
   }
+  return null;
+}
 
-/* -----------------------------
- * Route Handlers: Account summary by ID
- * ----------------------------- */
+async function fetchAccountSummaryById(env, token, accountId) {
+  const zohoUrl = `https://www.zohoapis.com/crm/v2/Accounts/${encodeURIComponent(accountId)}`;
+  const zohoJson = await callZoho(env, token, zohoUrl);
+  const record = Array.isArray(zohoJson.data) ? zohoJson.data[0] : zohoJson.data;
+  if (!record) return null;
+  return summarizeAccount(record);
+}
 
-  async function fetchAccountSummaryById(token, accountId) {
-    const zohoUrl = `https://www.zohoapis.com/crm/v2/Accounts/${encodeURIComponent(accountId)}`;
-    const zohoJson = await callZoho(env, token, zohoUrl);
-    const record = Array.isArray(zohoJson.data) ? zohoJson.data[0] : zohoJson.data;
-    if (!record) return null;
-    return summarizeAccount(record);
-  }
+function summarizeAccount(record) {
+  return {
+    id: record.id,
+    account_name: record.Account_Name ?? null,
+    website: record.Website ?? null,
 
-  function summarizeAccount(record) {
-    return {
-      id: record.id,
-      account_name: record.Account_Name ?? null,
-      website: record.Website ?? null,
+    compass_id: record.Compass_ID ?? null,
+    account_type: record.Account_Type ?? null,
+    dealer_tier: record.Dealer_Tier ?? null,
+    kam_owner: record.KAM_Owner ?? null,
+    rep_firm: record.Rep_Firm ?? null,
+    dealer_start_date: record.Dealer_Start_Date ?? null,
 
-      // customer-requested fields
-      compass_id: record.Compass_ID ?? null,
-      account_type: record.Account_Type ?? null,
-      dealer_tier: record.Dealer_Tier ?? null,
-      kam_owner: record.KAM_Owner ?? null,
-      rep_firm: record.Rep_Firm ?? null,
-      dealer_start_date: record.Dealer_Start_Date ?? null,
+    owner_name: record?.Owner?.name ?? null,
+    owner_email: record?.Owner?.email ?? null,
+    phone: record.Phone ?? null,
+    email_address: record.Email_Address ?? null,
+    modified_time: record.Modified_Time ?? null,
+  };
+}
 
-      // useful extras
-      owner_name: record?.Owner?.name ?? null,
-      owner_email: record?.Owner?.email ?? null,
-      phone: record.Phone ?? null,
-      email_address: record.Email_Address ?? null,
-      modified_time: record.Modified_Time ?? null,
-    };
-  }
+function buildZohoContactCreatePayload({ phone, engagementId, receivedAt }) {
+  return {
+    method: "POST",
+    url: "https://www.zohoapis.com/crm/v2/Contacts",
+    body: {
+      data: [
+        {
+          Last_Name: "Unknown Caller",
+          Phone: phone,
+          Lead_Source: "Inbound Call",
+          Description:
+            `Auto-created from Zoom Contact Center engagement ${engagementId} ` +
+            `received ${receivedAt}`,
+        },
+      ],
+    },
+  };
 }
 
 async function handleAccountSummary(request, env, ctx, url) {
