@@ -280,25 +280,33 @@ async function processEngagementWebhook(env, data) {
         });
       }
 
-      // Build proposed Zoho Desk ticket payload (dry-run — not dispatched).
-      const departmentId = pickDeskDepartmentId(env, engagementDetails);
-      if (departmentId) {
-        try {
-          const zohoToken = await getZohoAccessToken(env);
-          deskContactFound = await findZohoDeskContactByPhone(env, zohoToken, callerPhone);
-          deskTicketPayload = buildDeskTicketPayload({
-            phone: callerPhone,
-            engagementDetails,
-            phoneLookup: phoneLookupResult,
-            deskContact: deskContactFound,
-            departmentId,
-          });
-        } catch (err) {
-          deskTicketError = String(err?.message || err);
-          console.log("Desk ticket payload build failed:", deskTicketError);
-        }
+      // Skip Desk ticket entirely if the agent didn't set a disposition.
+      const hasDisposition =
+        Array.isArray(engagementDetails?.dispositions) &&
+        engagementDetails.dispositions.length > 0;
+
+      if (!hasDisposition) {
+        deskTicketError = "no disposition set — ticket creation skipped";
       } else {
-        deskTicketError = "no department mapping for queue/flow";
+        const departmentId = pickDeskDepartmentId(env, engagementDetails);
+        if (departmentId) {
+          try {
+            const zohoToken = await getZohoAccessToken(env);
+            deskContactFound = await findZohoDeskContactByPhone(env, zohoToken, callerPhone);
+            deskTicketPayload = buildDeskTicketPayload({
+              phone: callerPhone,
+              engagementDetails,
+              phoneLookup: phoneLookupResult,
+              deskContact: deskContactFound,
+              departmentId,
+            });
+          } catch (err) {
+            deskTicketError = String(err?.message || err);
+            console.log("Desk ticket payload build failed:", deskTicketError);
+          }
+        } else {
+          deskTicketError = "no department mapping for queue/flow";
+        }
       }
     }
 
