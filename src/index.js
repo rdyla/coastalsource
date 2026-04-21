@@ -580,22 +580,22 @@ function summarizeAccount(record) {
   };
 }
 
-function buildZohoContactCreatePayload({ phone, engagementId, receivedAt }) {
+function buildZohoContactCreatePayload({ phone, engagementId, receivedAt, ownerId }) {
+  const record = {
+    Last_Name: "Unknown Caller",
+    Phone: phone,
+    Lead_Source: "Inbound Call",
+    Description:
+      `Auto-created from Zoom Contact Center engagement ${engagementId} ` +
+      `received ${receivedAt}`,
+  };
+  if (ownerId) {
+    record.Owner = { id: ownerId };
+  }
   return {
     method: "POST",
     url: "https://www.zohoapis.com/crm/v2/Contacts",
-    body: {
-      data: [
-        {
-          Last_Name: "Unknown Caller",
-          Phone: phone,
-          Lead_Source: "Inbound Call",
-          Description:
-            `Auto-created from Zoom Contact Center engagement ${engagementId} ` +
-            `received ${receivedAt}`,
-        },
-      ],
-    },
+    body: { data: [record] },
   };
 }
 
