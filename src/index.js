@@ -74,7 +74,18 @@ async function handleZoomRoutes(request, env, ctx, url) {
     if (request.method === "DELETE") return handleWebhookDelete(env, id);
   }
 
+  const engagementMatch = url.pathname.match(/^\/zoom\/engagement\/([^/]+)$/);
+  if (engagementMatch && request.method === "GET") {
+    const engagementId = decodeURIComponent(engagementMatch[1]);
+    return handleEngagementFetch(env, engagementId);
+  }
+
   return json({ error: "Not Found" }, 404);
+}
+
+async function handleEngagementFetch(env, engagementId) {
+  const details = await fetchZoomEngagement(env, engagementId);
+  return json(details);
 }
 
 /* -----------------------------
@@ -91,8 +102,8 @@ async function handleWebhookCatch(request, env, ctx, url) {
     parsedBody = null;
   }
 
-  // Zoom URL validation challenge — must respond with HMAC-SHA256 of plainToken
-  // using the webhook secret. No storage needed (no customer data).
+  // Zoom URL validation challenge — respond with HMAC-SHA256 of plainToken.
+  // This event is sent during setup only; no signature verification needed.
   if (
     parsedBody?.event === "endpoint.url_validation" &&
     parsedBody?.payload?.plainToken
@@ -105,6 +116,13 @@ async function handleWebhookCatch(request, env, ctx, url) {
     return json({ plainToken, encryptedToken });
   }
 
+  // Verify x-zm-signature on real events.
+  const sigResult = await verifyZoomSignature(request, rawBody, env);
+  if (!sigResult.ok) {
+    console.log("Zoom signature verification failed:", sigResult.reason);
+    return json({ error: "Invalid signature", reason: sigResult.reason }, 401);
+  }
+
   const headers = {};
   for (const [k, v] of request.headers.entries()) headers[k] = v;
 
@@ -113,6 +131,23 @@ async function handleWebhookCatch(request, env, ctx, url) {
 
   const receivedAt = new Date().toISOString();
   const id = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+
+  // If this is an engagement-ready event, fetch the engagement details
+  // from Zoom's API and attach them so we have one collated record.
+  let engagementDetails = null;
+  let engagementFetchError = null;
+  const engagementId = parsedBody?.payload?.object?.engagement_id;
+  if (
+    parsedBody?.event === "contact_center.cx_engagement_end_data_ready" &&
+    engagementId
+  ) {
+    try {
+      engagementDetails = await fetchZoomEngagement(env, engagementId);
+    } catch (err) {
+      engagementFetchError = String(err?.message || err);
+      console.log("Zoom engagement fetch failed:", engagementFetchError);
+    }
+  }
 
   const record = {
     id,
@@ -123,6 +158,8 @@ async function handleWebhookCatch(request, env, ctx, url) {
     headers,
     raw_body: rawBody,
     parsed_body: parsedBody,
+    engagement_details: engagementDetails,
+    engagement_fetch_error: engagementFetchError,
   };
 
   console.log("Zoom webhook received:", JSON.stringify(record));
@@ -135,6 +172,40 @@ async function handleWebhookCatch(request, env, ctx, url) {
 
   // Ack quickly so Zoom doesn't retry
   return json({ ok: true, id });
+}
+
+async function verifyZoomSignature(request, rawBody, env) {
+  if (!env.ZOOM_WEBHOOK_SECRET) {
+    return { ok: false, reason: "ZOOM_WEBHOOK_SECRET not configured" };
+  }
+  const sigHeader = request.headers.get("x-zm-signature");
+  const ts = request.headers.get("x-zm-request-timestamp");
+  if (!sigHeader || !ts) {
+    return { ok: false, reason: "missing signature headers" };
+  }
+
+  // Reject timestamps older than 5 minutes to limit replay window.
+  const tsNum = Number(ts);
+  if (!Number.isFinite(tsNum) || Math.abs(Date.now() / 1000 - tsNum) > 300) {
+    return { ok: false, reason: "timestamp out of range" };
+  }
+
+  const message = `v0:${ts}:${rawBody}`;
+  const expected = `v0=${await hmacSha256Hex(env.ZOOM_WEBHOOK_SECRET, message)}`;
+
+  if (!timingSafeEqualStr(sigHeader, expected)) {
+    return { ok: false, reason: "signature mismatch" };
+  }
+  return { ok: true };
+}
+
+function timingSafeEqualStr(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
 }
 
 async function hmacSha256Hex(secret, message) {
@@ -575,4 +646,89 @@ async function clearCachedToken(env) {
   if (env.coastalsource_kv) {
     await env.coastalsource_kv.delete("zoho_token");
   }
+}
+
+/* -----------------------------
+ * Zoom S2S OAuth + Contact Center API
+ * ----------------------------- */
+
+let zoomMemoryToken = null;
+let zoomMemoryTokenExpMs = 0;
+
+async function getZoomAccessToken(env) {
+  const now = Date.now();
+
+  if (env.coastalsource_kv) {
+    const raw = await env.coastalsource_kv.get("zoom_token", { type: "json" });
+    if (raw?.access_token && raw?.exp_ms && now < raw.exp_ms - 30_000) {
+      return raw.access_token;
+    }
+  } else if (zoomMemoryToken && now < zoomMemoryTokenExpMs - 30_000) {
+    return zoomMemoryToken;
+  }
+
+  if (!env.ZOOM_ACCOUNT_ID || !env.ZOOM_CLIENT_ID || !env.ZOOM_CLIENT_SECRET) {
+    throw new Error("Zoom S2S OAuth credentials not configured");
+  }
+
+  const basic = btoa(`${env.ZOOM_CLIENT_ID}:${env.ZOOM_CLIENT_SECRET}`);
+  const tokenUrl =
+    `https://zoom.us/oauth/token?grant_type=account_credentials&account_id=` +
+    encodeURIComponent(env.ZOOM_ACCOUNT_ID);
+
+  const res = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { Authorization: `Basic ${basic}` },
+  });
+  const data = await res.json();
+  if (!res.ok || !data.access_token) {
+    throw new Error(`Zoom token request failed: ${JSON.stringify(data)}`);
+  }
+
+  const expiresInSec = Number(data.expires_in) || 3600;
+  const expMs = now + expiresInSec * 1000;
+
+  if (env.coastalsource_kv) {
+    await env.coastalsource_kv.put(
+      "zoom_token",
+      JSON.stringify({ access_token: data.access_token, exp_ms: expMs }),
+      { expirationTtl: expiresInSec }
+    );
+  } else {
+    zoomMemoryToken = data.access_token;
+    zoomMemoryTokenExpMs = expMs;
+  }
+
+  return data.access_token;
+}
+
+async function fetchZoomEngagement(env, engagementId) {
+  const token = await getZoomAccessToken(env);
+  const zoomUrl =
+    `https://api.zoom.us/v2/contact_center/engagements/` +
+    encodeURIComponent(engagementId);
+
+  const res = await fetch(zoomUrl, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  const text = await res.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = { raw: text };
+  }
+
+  if (!res.ok) {
+    if (res.status === 401 && env.coastalsource_kv) {
+      await env.coastalsource_kv.delete("zoom_token");
+    }
+    const err = new Error("Zoom engagement fetch failed");
+    err.status = res.status;
+    err.details = body;
+    throw err;
+  }
+
+  return body;
 }
