@@ -1223,6 +1223,23 @@ function splitName(fullName) {
   return { firstName: parts[0], lastName: parts.slice(1).join(" ") };
 }
 
+function buildUserDisplayNameMap(engagementDetails) {
+  const map = {};
+  if (Array.isArray(engagementDetails?.agents)) {
+    for (const a of engagementDetails.agents) {
+      if (a?.user_id) map[a.user_id] = a.display_name || a.user_display_name || a.user_id;
+    }
+  }
+  if (Array.isArray(engagementDetails?.events)) {
+    for (const e of engagementDetails.events) {
+      if (e?.user_id && !map[e.user_id]) {
+        map[e.user_id] = e.user_display_name || e.user_id;
+      }
+    }
+  }
+  return map;
+}
+
 function pickDeskDepartmentId(env, engagementDetails) {
   const queueName = engagementDetails?.queues?.[0]?.queue_name || "";
   const flowName = engagementDetails?.flows?.[0]?.flow_name || "";
@@ -1261,6 +1278,18 @@ function buildDeskTicketPayload({
     `Talk duration: ${engagementDetails?.talk_duration ?? "-"}s`,
     `Handling duration: ${engagementDetails?.handling_duration ?? "-"}s`,
   ].filter(Boolean);
+
+  const notes = Array.isArray(engagementDetails?.notes) ? engagementDetails.notes : [];
+  if (notes.length > 0) {
+    const userMap = buildUserDisplayNameMap(engagementDetails);
+    descLines.push("");
+    descLines.push("Agent notes:");
+    for (const n of notes) {
+      const author = userMap[n.user_id] || n.user_id || "Unknown";
+      const ts = n.last_modified_time ? `, ${n.last_modified_time}` : "";
+      descLines.push(`- ${n.note} (${author}${ts})`);
+    }
+  }
 
   const ticket = {
     subject,
