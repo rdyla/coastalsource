@@ -24,20 +24,17 @@ export default {
  * ----------------------------- */
 
 async function handleZohoRoutes(request, env, ctx, url) {
-  if (request.method !== "GET") {
-    return json({ error: "Method Not Allowed" }, 405);
-  }
-
   const authErr = requireApiKey(request, env);
   if (authErr) return authErr;
 
   const routes = {
-    "/zoho/leads": handleLeads,
-    "/zoho/account-summary": handleAccountSummary,
-    "/zoho/lookup-by-phone": handleLookupByPhone,
+    "GET /zoho/leads": handleLeads,
+    "GET /zoho/account-summary": handleAccountSummary,
+    "GET /zoho/lookup-by-phone": handleLookupByPhone,
+    "POST /zoho/create-contact": handleCreateContact,
   };
 
-  const handler = routes[url.pathname];
+  const handler = routes[`${request.method} ${url.pathname}`];
   if (!handler) return json({ error: "Not Found" }, 404);
 
   return handler(request, env, ctx, url);
@@ -459,6 +456,154 @@ async function handleLookupByPhone(request, env, ctx, url) {
   const phoneRaw = url.searchParams.get("phone");
   if (!phoneRaw) return json({ error: "Missing query param", required: ["phone"] }, 400);
   return json(await lookupZohoByPhone(env, phoneRaw));
+}
+
+async function handleCreateContact(request, env, ctx, url) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
+
+  const phone = body?.phone ? String(body.phone).trim() : null;
+  if (!phone) {
+    return json({ error: "Missing required field", required: ["phone"] }, 400);
+  }
+
+  const dedupe = body?.dedupe !== false; // default true
+  const dryRun = body?.dry_run !== false; // default true — explicit opt-in for real writes
+
+  let existing = null;
+  if (dedupe) {
+    try {
+      const lookup = await lookupZohoByPhone(env, phone);
+      if (lookup.found && lookup.match_type === "contact" && lookup.contact) {
+        existing = lookup.contact;
+      }
+    } catch (err) {
+      console.log("Dedupe lookup failed:", String(err?.message || err));
+    }
+  }
+
+  if (existing) {
+    return json({
+      created: false,
+      matched_existing: true,
+      dry_run: dryRun,
+      contact: existing,
+    });
+  }
+
+  const record = {
+    Last_Name: body.last_name || "Unknown Caller",
+    Phone: phone,
+    Lead_Source: body.lead_source || "Inbound Call",
+  };
+  if (body.first_name) record.First_Name = body.first_name;
+  if (body.email) record.Email = body.email;
+  if (body.description) {
+    record.Description = body.description;
+  } else if (body.engagement_id) {
+    record.Description =
+      `Auto-created from Zoom Contact Center engagement ${body.engagement_id} ` +
+      `received ${new Date().toISOString()}`;
+  }
+
+  let ownerResolution = null;
+  if (body.zoom_agent_user_id) {
+    try {
+      ownerResolution = await resolveZohoOwnerForZoomAgent(env, body.zoom_agent_user_id);
+      if (ownerResolution?.zoho_user_id) {
+        record.Owner = { id: ownerResolution.zoho_user_id };
+      }
+    } catch (err) {
+      ownerResolution = {
+        zoom_user_id: body.zoom_agent_user_id,
+        zoho_user_id: null,
+        error: String(err?.message || err),
+        error_status: err?.status ?? null,
+        error_details: err?.details ?? null,
+      };
+      console.log("Owner resolution failed in create-contact:", JSON.stringify(ownerResolution));
+    }
+  }
+
+  const zohoPayload = { data: [record] };
+
+  if (dryRun) {
+    return json({
+      created: false,
+      dry_run: true,
+      matched_existing: false,
+      proposed_payload: {
+        method: "POST",
+        url: "https://www.zohoapis.com/crm/v2/Contacts",
+        body: zohoPayload,
+      },
+      owner_resolution: ownerResolution,
+    });
+  }
+
+  const token = await getZohoAccessToken(env);
+  const zohoRes = await fetch("https://www.zohoapis.com/crm/v2/Contacts", {
+    method: "POST",
+    headers: {
+      Authorization: `Zoho-oauthtoken ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(zohoPayload),
+  });
+  const text = await zohoRes.text();
+  let zohoJson = null;
+  try {
+    zohoJson = text ? JSON.parse(text) : null;
+  } catch {
+    zohoJson = { raw: text };
+  }
+
+  if (!zohoRes.ok) {
+    return json(
+      {
+        created: false,
+        dry_run: false,
+        error: "Zoho create failed",
+        zoho_status: zohoRes.status,
+        zoho_response: zohoJson,
+        proposed_payload: { body: zohoPayload },
+      },
+      502
+    );
+  }
+
+  const first = zohoJson?.data?.[0];
+  if (first?.status === "success" && first?.details?.id) {
+    return json({
+      created: true,
+      dry_run: false,
+      matched_existing: false,
+      contact: {
+        id: first.details.id,
+        phone,
+        first_name: record.First_Name || null,
+        last_name: record.Last_Name,
+        email: record.Email || null,
+        owner_id: record.Owner?.id || null,
+      },
+      owner_resolution: ownerResolution,
+      zoho_response: zohoJson,
+    });
+  }
+
+  return json(
+    {
+      created: false,
+      dry_run: false,
+      error: "Unexpected Zoho response shape",
+      zoho_response: zohoJson,
+    },
+    500
+  );
 }
 
 async function lookupZohoByPhone(env, phoneRaw) {
