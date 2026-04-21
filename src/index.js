@@ -1077,7 +1077,7 @@ async function handlePopupEntry(env, url) {
   }
 
   if (lookup.found) {
-    const searchword = lookup.account?.compass_id || phone;
+    const searchword = lookup.account?.compass_id || normalizePhoneForSearch(phone);
     return Response.redirect(zohoSearchUrl(searchword), 302);
   }
 
@@ -1117,7 +1117,7 @@ async function handlePopupSubmit(request, env) {
   try {
     const existing = await lookupZohoByPhone(env, phone);
     if (existing.found && existing.match_type === "contact") {
-      const searchword = existing.account?.compass_id || phone;
+      const searchword = existing.account?.compass_id || normalizePhoneForSearch(phone);
       return Response.redirect(zohoSearchUrl(searchword), 302);
     }
   } catch (err) {
@@ -1167,11 +1167,17 @@ async function handlePopupSubmit(request, env) {
     );
   }
 
-  return Response.redirect(zohoSearchUrl(phone), 302);
+  return Response.redirect(zohoSearchUrl(normalizePhoneForSearch(phone)), 302);
 }
 
 function zohoSearchUrl(searchword) {
   return `${ZOHO_SEARCH_URL_BASE}?searchword=${encodeURIComponent(searchword)}&isRelevance=false`;
+}
+
+function normalizePhoneForSearch(phoneRaw) {
+  const digits = String(phoneRaw || "").replace(/\D/g, "");
+  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  return digits;
 }
 
 async function generatePopupToken(env, phone, engagementId, expiresAt) {
