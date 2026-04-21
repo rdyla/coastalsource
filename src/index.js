@@ -9,6 +9,9 @@ export default {
       if (url.pathname.startsWith("/zoom/")) {
         return await handleZoomRoutes(request, env, ctx, url);
       }
+      if (url.pathname === "/popup" || url.pathname.startsWith("/popup/")) {
+        return await handlePopupRoutes(request, env, ctx, url);
+      }
       return json({ error: "Not Found" }, 404);
     } catch (err) {
       if (err?.details && err?.status) {
@@ -1036,4 +1039,245 @@ async function fetchZoomEngagement(env, engagementId) {
   }
 
   return body;
+}
+
+/* -----------------------------
+ * Popup page: screen-pop entry + create-contact form
+ * ----------------------------- */
+
+const ZOHO_SEARCH_URL_BASE =
+  "https://crmplus.zoho.com/coastalsource/index.do/cxapp/crm/org728200559/search";
+
+async function handlePopupRoutes(request, env, ctx, url) {
+  if (url.pathname === "/popup" && request.method === "GET") {
+    return handlePopupEntry(env, url);
+  }
+  if (url.pathname === "/popup/submit" && request.method === "POST") {
+    return handlePopupSubmit(request, env);
+  }
+  return htmlResponse("<h1>Not Found</h1>", 404);
+}
+
+async function handlePopupEntry(env, url) {
+  const phone = (url.searchParams.get("phone") || "").trim();
+  const engagementId = (url.searchParams.get("engagement_id") || "").trim();
+
+  if (!phone) {
+    return htmlResponse("<h1>Missing phone parameter</h1>", 400);
+  }
+
+  let lookup;
+  try {
+    lookup = await lookupZohoByPhone(env, phone);
+  } catch (err) {
+    return htmlResponse(
+      `<h1>Lookup failed</h1><pre>${escapeHtml(String(err?.message || err))}</pre>`,
+      500
+    );
+  }
+
+  if (lookup.found) {
+    const searchword = lookup.account?.compass_id || phone;
+    return Response.redirect(zohoSearchUrl(searchword), 302);
+  }
+
+  const expiresAt = Date.now() + 30 * 60 * 1000;
+  const token = await generatePopupToken(env, phone, engagementId, expiresAt);
+  return htmlResponse(renderCreateForm({ phone, engagementId, token, expiresAt }));
+}
+
+async function handlePopupSubmit(request, env) {
+  const form = await request.formData();
+
+  const phone = String(form.get("phone") || "").trim();
+  const engagementId = String(form.get("engagement_id") || "").trim();
+  const token = String(form.get("token") || "");
+  const expiresAt = Number(form.get("expires_at") || "0");
+
+  if (!phone || !token) {
+    return htmlResponse("<h1>Missing required fields</h1>", 400);
+  }
+
+  const tokenValid = await verifyPopupToken(env, phone, engagementId, expiresAt, token);
+  if (!tokenValid) {
+    return htmlResponse(
+      "<h1>Form expired</h1><p>Close this tab and reopen the contact popup to try again.</p>",
+      403
+    );
+  }
+
+  const firstName = String(form.get("first_name") || "").trim();
+  const lastName = String(form.get("last_name") || "").trim() || "Unknown Caller";
+  const email = String(form.get("email") || "").trim();
+  const company = String(form.get("company") || "").trim();
+  const notes = String(form.get("notes") || "").trim();
+
+  // Dedupe — if someone else (webhook, another popup) already created this contact,
+  // skip the write and go straight to the search page.
+  try {
+    const existing = await lookupZohoByPhone(env, phone);
+    if (existing.found && existing.match_type === "contact") {
+      const searchword = existing.account?.compass_id || phone;
+      return Response.redirect(zohoSearchUrl(searchword), 302);
+    }
+  } catch (err) {
+    console.log("Popup dedupe lookup failed:", String(err?.message || err));
+  }
+
+  const descParts = [];
+  if (engagementId) {
+    descParts.push(`Created from Zoom engagement ${engagementId} on ${new Date().toISOString()}`);
+  }
+  if (company) descParts.push(`Company: ${company}`);
+  if (notes) descParts.push(`Notes: ${notes}`);
+
+  const record = {
+    Last_Name: lastName,
+    Phone: phone,
+    Lead_Source: "Inbound Call",
+  };
+  if (firstName) record.First_Name = firstName;
+  if (email) record.Email = email;
+  if (descParts.length) record.Description = descParts.join("\n");
+
+  const zohoToken = await getZohoAccessToken(env);
+  const zohoRes = await fetch("https://www.zohoapis.com/crm/v2/Contacts", {
+    method: "POST",
+    headers: {
+      Authorization: `Zoho-oauthtoken ${zohoToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ data: [record] }),
+  });
+  const text = await zohoRes.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = { raw: text };
+  }
+
+  if (!zohoRes.ok || body?.data?.[0]?.status !== "success") {
+    return htmlResponse(
+      `<h1>Zoho create failed</h1>
+       <p>The contact was not created. Details below:</p>
+       <pre>${escapeHtml(JSON.stringify(body, null, 2))}</pre>
+       <p><a href="javascript:history.back()">Go back</a></p>`,
+      502
+    );
+  }
+
+  return Response.redirect(zohoSearchUrl(phone), 302);
+}
+
+function zohoSearchUrl(searchword) {
+  return `${ZOHO_SEARCH_URL_BASE}?searchword=${encodeURIComponent(searchword)}&isRelevance=false`;
+}
+
+async function generatePopupToken(env, phone, engagementId, expiresAt) {
+  if (!env.ZOOM_WEBHOOK_SECRET) {
+    throw new Error("ZOOM_WEBHOOK_SECRET not configured");
+  }
+  return hmacSha256Hex(env.ZOOM_WEBHOOK_SECRET, `${phone}|${engagementId}|${expiresAt}`);
+}
+
+async function verifyPopupToken(env, phone, engagementId, expiresAt, token) {
+  if (!Number.isFinite(expiresAt) || Date.now() > expiresAt) return false;
+  if (!env.ZOOM_WEBHOOK_SECRET) return false;
+  const expected = await hmacSha256Hex(
+    env.ZOOM_WEBHOOK_SECRET,
+    `${phone}|${engagementId}|${expiresAt}`
+  );
+  return timingSafeEqualStr(token, expected);
+}
+
+function htmlResponse(html, status = 200) {
+  return new Response(html, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  );
+}
+
+function renderCreateForm({ phone, engagementId, token, expiresAt }) {
+  const esc = escapeHtml;
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Create Contact</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; max-width: 540px; margin: 30px auto; padding: 0 20px; color: #222; }
+  h1 { font-size: 20px; margin-bottom: 8px; }
+  .info { background: #eef4fb; border: 1px solid #cfe0f3; padding: 12px 14px; border-radius: 6px; margin-bottom: 20px; font-size: 14px; }
+  .info strong { color: #0050a0; }
+  label { display: block; margin-top: 14px; font-weight: 600; font-size: 13px; color: #333; }
+  input, textarea { width: 100%; padding: 8px 10px; margin-top: 4px; border: 1px solid #c0c4c9; border-radius: 4px; font-size: 14px; box-sizing: border-box; font-family: inherit; }
+  input:focus, textarea:focus { outline: none; border-color: #0066cc; box-shadow: 0 0 0 2px rgba(0,102,204,0.15); }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  .actions { margin-top: 24px; }
+  button { padding: 10px 18px; background: #0066cc; color: #fff; border: 0; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 600; }
+  button:hover { background: #0052a3; }
+  button:disabled { background: #888; cursor: not-allowed; }
+  .cancel { background: #e0e4e8; color: #333; margin-left: 8px; }
+  .cancel:hover { background: #c8ccd0; }
+</style>
+</head>
+<body>
+  <h1>Create new contact</h1>
+  <div class="info">
+    No existing Zoho contact was found for <strong>${esc(phone)}</strong>.
+    Fill in what you know and we'll create the contact now.
+  </div>
+  <form method="POST" action="/popup/submit">
+    <input type="hidden" name="phone" value="${esc(phone)}">
+    <input type="hidden" name="engagement_id" value="${esc(engagementId)}">
+    <input type="hidden" name="token" value="${esc(token)}">
+    <input type="hidden" name="expires_at" value="${esc(expiresAt)}">
+
+    <div class="row">
+      <div>
+        <label for="first_name">First Name</label>
+        <input id="first_name" name="first_name" autocomplete="given-name">
+      </div>
+      <div>
+        <label for="last_name">Last Name</label>
+        <input id="last_name" name="last_name" placeholder="Unknown Caller" autocomplete="family-name">
+      </div>
+    </div>
+
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" autocomplete="email">
+
+    <label for="company">Company</label>
+    <input id="company" name="company">
+
+    <label for="notes">Notes</label>
+    <textarea id="notes" name="notes" rows="3"></textarea>
+
+    <div class="actions">
+      <button type="submit" id="submit-btn">Create Contact</button>
+      <button type="button" class="cancel" onclick="window.close()">Cancel</button>
+    </div>
+  </form>
+  <script>
+    document.querySelector('form').addEventListener('submit', function () {
+      var btn = document.getElementById('submit-btn');
+      btn.disabled = true;
+      btn.textContent = 'Creating...';
+    });
+  </script>
+</body>
+</html>`;
 }
