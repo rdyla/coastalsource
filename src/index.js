@@ -86,6 +86,20 @@ async function handleWebhookCatch(request, env, ctx, url) {
     parsedBody = null;
   }
 
+  // Zoom URL validation challenge — must respond with HMAC-SHA256 of plainToken
+  // using the webhook secret. No storage needed (no customer data).
+  if (
+    parsedBody?.event === "endpoint.url_validation" &&
+    parsedBody?.payload?.plainToken
+  ) {
+    const plainToken = parsedBody.payload.plainToken;
+    if (!env.ZOOM_WEBHOOK_SECRET) {
+      return json({ error: "ZOOM_WEBHOOK_SECRET not configured" }, 500);
+    }
+    const encryptedToken = await hmacSha256Hex(env.ZOOM_WEBHOOK_SECRET, plainToken);
+    return json({ plainToken, encryptedToken });
+  }
+
   const headers = {};
   for (const [k, v] of request.headers.entries()) headers[k] = v;
 
@@ -116,6 +130,18 @@ async function handleWebhookCatch(request, env, ctx, url) {
 
   // Ack quickly so Zoom doesn't retry
   return json({ ok: true, id });
+}
+
+async function hmacSha256Hex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 async function handleWebhooksRecent(request, env) {
