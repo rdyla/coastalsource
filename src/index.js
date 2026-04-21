@@ -1045,8 +1045,9 @@ async function fetchZoomEngagement(env, engagementId) {
  * Popup page: screen-pop entry + create-contact form
  * ----------------------------- */
 
-const ZOHO_SEARCH_URL_BASE =
-  "https://crmplus.zoho.com/coastalsource/index.do/cxapp/crm/org728200559/search";
+const ZOHO_CRM_PLUS_BASE =
+  "https://crmplus.zoho.com/coastalsource/index.do/cxapp/crm/org728200559";
+const ZOHO_SEARCH_URL_BASE = `${ZOHO_CRM_PLUS_BASE}/search`;
 
 async function handlePopupRoutes(request, env, ctx, url) {
   if (url.pathname === "/popup" && request.method === "GET") {
@@ -1077,6 +1078,12 @@ async function handlePopupEntry(env, url) {
   }
 
   if (lookup.found) {
+    if (lookup.match_type === "contact" && lookup.contact?.id) {
+      return Response.redirect(zohoContactDetailUrl(lookup.contact.id), 302);
+    }
+    if (lookup.match_type === "account" && lookup.account?.id) {
+      return Response.redirect(zohoAccountDetailUrl(lookup.account.id), 302);
+    }
     const searchword = lookup.account?.compass_id || normalizePhoneForSearch(phone);
     return Response.redirect(zohoSearchUrl(searchword), 302);
   }
@@ -1116,9 +1123,8 @@ async function handlePopupSubmit(request, env) {
   // skip the write and go straight to the search page.
   try {
     const existing = await lookupZohoByPhone(env, phone);
-    if (existing.found && existing.match_type === "contact") {
-      const searchword = existing.account?.compass_id || normalizePhoneForSearch(phone);
-      return Response.redirect(zohoSearchUrl(searchword), 302);
+    if (existing.found && existing.match_type === "contact" && existing.contact?.id) {
+      return Response.redirect(zohoContactDetailUrl(existing.contact.id), 302);
     }
   } catch (err) {
     console.log("Popup dedupe lookup failed:", String(err?.message || err));
@@ -1167,11 +1173,23 @@ async function handlePopupSubmit(request, env) {
     );
   }
 
+  const newContactId = body?.data?.[0]?.details?.id;
+  if (newContactId) {
+    return Response.redirect(zohoContactDetailUrl(newContactId), 302);
+  }
   return Response.redirect(zohoSearchUrl(normalizePhoneForSearch(phone)), 302);
 }
 
 function zohoSearchUrl(searchword) {
   return `${ZOHO_SEARCH_URL_BASE}?searchword=${encodeURIComponent(searchword)}&isRelevance=false`;
+}
+
+function zohoContactDetailUrl(contactId) {
+  return `${ZOHO_CRM_PLUS_BASE}/tab/Contacts/${encodeURIComponent(contactId)}`;
+}
+
+function zohoAccountDetailUrl(accountId) {
+  return `${ZOHO_CRM_PLUS_BASE}/tab/Accounts/${encodeURIComponent(accountId)}`;
 }
 
 function normalizePhoneForSearch(phoneRaw) {
