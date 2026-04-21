@@ -178,6 +178,9 @@ async function processEngagementWebhook(env, data) {
   let phoneLookupResult = null;
   let ownerResolution = null;
   let zohoCreatePayload = null;
+  let deskContactFound = null;
+  let deskTicketPayload = null;
+  let deskTicketError = null;
 
   if (isEngagementReady && !duplicateOf) {
     try {
@@ -219,6 +222,24 @@ async function processEngagementWebhook(env, data) {
           ownerId: ownerResolution?.zoho_user_id || null,
         });
       }
+
+      // Build proposed Zoho Desk ticket payload (dry-run — not dispatched).
+      if (env.ZOHO_DESK_DEFAULT_DEPARTMENT_ID) {
+        try {
+          const zohoToken = await getZohoAccessToken(env);
+          deskContactFound = await findZohoDeskContactByPhone(env, zohoToken, callerPhone);
+          deskTicketPayload = buildDeskTicketPayload({
+            phone: callerPhone,
+            engagementDetails,
+            phoneLookup: phoneLookupResult,
+            deskContact: deskContactFound,
+            departmentId: env.ZOHO_DESK_DEFAULT_DEPARTMENT_ID,
+          });
+        } catch (err) {
+          deskTicketError = String(err?.message || err);
+          console.log("Desk ticket payload build failed:", deskTicketError);
+        }
+      }
     }
 
     if (env.coastalsource_kv) {
@@ -244,6 +265,12 @@ async function processEngagementWebhook(env, data) {
     owner_resolution: ownerResolution,
     zoho_create_payload: zohoCreatePayload,
     zoho_create_dispatched: false,
+    desk_contact_found: deskContactFound
+      ? { id: deskContactFound.id, firstName: deskContactFound.firstName, lastName: deskContactFound.lastName, email: deskContactFound.email, phone: deskContactFound.phone }
+      : null,
+    desk_ticket_payload: deskTicketPayload,
+    desk_ticket_error: deskTicketError,
+    desk_ticket_dispatched: false,
   };
 
   console.log("Zoom webhook processed:", JSON.stringify(record));
@@ -1039,6 +1066,123 @@ async function fetchZoomEngagement(env, engagementId) {
   }
 
   return body;
+}
+
+/* -----------------------------
+ * Zoho Desk helpers
+ * ----------------------------- */
+
+async function callZohoDesk(env, accessToken, path, options = {}) {
+  if (!env.ZOHO_DESK_ORG_ID) throw new Error("ZOHO_DESK_ORG_ID not configured");
+  const url = `https://desk.zoho.com/api/v1${path}`;
+  const res = await fetch(url, {
+    method: options.method || "GET",
+    headers: {
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      orgId: String(env.ZOHO_DESK_ORG_ID),
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.headers || {}),
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+  if (!res.ok) {
+    const err = new Error("Zoho Desk request failed");
+    err.status = res.status;
+    err.details = json ?? { raw: text?.slice(0, 500) || null };
+    throw err;
+  }
+  return json ?? { raw: text };
+}
+
+async function findZohoDeskContactByPhone(env, accessToken, phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (!digits) return null;
+
+  const attempts = new Set([phone, digits]);
+  if (digits.length === 11 && digits.startsWith("1")) attempts.add(digits.slice(1));
+  if (digits.length === 10) attempts.add("1" + digits);
+
+  for (const attempt of attempts) {
+    try {
+      const data = await callZohoDesk(
+        env,
+        accessToken,
+        `/contacts/search?phone=${encodeURIComponent(attempt)}`
+      );
+      if (Array.isArray(data?.data) && data.data.length > 0) return data.data[0];
+    } catch (err) {
+      console.log(`Desk contact search (${attempt}) failed:`, String(err?.message || err));
+    }
+  }
+  return null;
+}
+
+function splitName(fullName) {
+  const parts = String(fullName || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return { firstName: "", lastName: "Unknown Caller" };
+  if (parts.length === 1) return { firstName: "", lastName: parts[0] };
+  return { firstName: parts[0], lastName: parts.slice(1).join(" ") };
+}
+
+function buildDeskTicketPayload({
+  phone,
+  engagementDetails,
+  phoneLookup,
+  deskContact,
+  departmentId,
+}) {
+  const contactName = phoneLookup?.contact?.name || "Unknown Caller";
+  const nowLocal = new Date().toISOString().replace("T", " ").slice(0, 16);
+  const subject = `Inbound call from ${contactName} — ${nowLocal}`;
+
+  const agent = engagementDetails?.agents?.[0];
+  const queue = engagementDetails?.queues?.[0];
+  const descLines = [
+    `Engagement ID: ${engagementDetails?.engagement_id ?? "-"}`,
+    `Phone: ${phone}`,
+    `Direction: ${engagementDetails?.direction ?? "-"}`,
+    agent ? `Agent: ${agent.display_name || "-"}` : null,
+    queue ? `Queue: ${queue.queue_name}` : null,
+    `Start: ${engagementDetails?.start_time ?? "-"}`,
+    `End: ${engagementDetails?.end_time ?? "-"}`,
+    `Talk duration: ${engagementDetails?.talk_duration ?? "-"}s`,
+    `Handling duration: ${engagementDetails?.handling_duration ?? "-"}s`,
+  ].filter(Boolean);
+
+  const ticket = {
+    subject,
+    description: descLines.join("\n"),
+    departmentId: String(departmentId),
+    channel: "Phone",
+    phone,
+    priority: "Medium",
+    status: "Open",
+  };
+
+  if (deskContact?.id) {
+    ticket.contactId = String(deskContact.id);
+  } else {
+    const { firstName, lastName } = splitName(contactName);
+    ticket.contact = {
+      lastName: lastName || "Unknown Caller",
+      phone,
+    };
+    if (firstName) ticket.contact.firstName = firstName;
+  }
+
+  return {
+    method: "POST",
+    url: "https://desk.zoho.com/api/v1/tickets",
+    headers: { orgId: "<from ZOHO_DESK_ORG_ID>" },
+    body: ticket,
+  };
 }
 
 /* -----------------------------
