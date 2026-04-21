@@ -1133,7 +1133,8 @@ async function fetchZoomEngagement(env, engagementId) {
   const token = await getZoomAccessToken(env);
   const zoomUrl =
     `https://api.zoom.us/v2/contact_center/engagements/` +
-    encodeURIComponent(engagementId);
+    encodeURIComponent(engagementId) +
+    `?include=notes,disposition`;
 
   const res = await fetch(zoomUrl, {
     headers: { Authorization: `Bearer ${token}` },
@@ -1267,12 +1268,22 @@ function buildDeskTicketPayload({
 
   const agent = engagementDetails?.agents?.[0];
   const queue = engagementDetails?.queues?.[0];
+
+  const dispositions = Array.isArray(engagementDetails?.dispositions)
+    ? engagementDetails.dispositions
+    : [];
+  const dispositionNames = dispositions
+    .map((d) => d?.disposition_name)
+    .filter(Boolean)
+    .join(", ");
+
   const descLines = [
     `Engagement ID: ${engagementDetails?.engagement_id ?? "-"}`,
     `Phone: ${phone}`,
     `Direction: ${engagementDetails?.direction ?? "-"}`,
     agent ? `Agent: ${agent.display_name || "-"}` : null,
     queue ? `Queue: ${queue.queue_name}` : null,
+    dispositionNames ? `Disposition: ${dispositionNames}` : null,
     `Start: ${engagementDetails?.start_time ?? "-"}`,
     `End: ${engagementDetails?.end_time ?? "-"}`,
     `Talk duration: ${engagementDetails?.talk_duration ?? "-"}s`,
