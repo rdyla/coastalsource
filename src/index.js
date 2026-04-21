@@ -181,8 +181,18 @@ async function processEngagementWebhook(env, data) {
   let deskContactFound = null;
   let deskTicketPayload = null;
   let deskTicketError = null;
+  let deskTicketDispatched = false;
+  let deskTicketId = null;
 
   if (isEngagementReady && !duplicateOf) {
+    // Claim this engagement immediately so a racing concurrent webhook
+    // overwrites this key and the later ownership re-check kicks it out.
+    if (env.coastalsource_kv) {
+      await env.coastalsource_kv.put(`engagement_seen:${engagementId}`, id, {
+        expirationTtl: 60 * 60 * 24 * 7,
+      });
+    }
+
     try {
       engagementDetails = await fetchZoomEngagement(env, engagementId);
     } catch (err) {
@@ -245,10 +255,41 @@ async function processEngagementWebhook(env, data) {
       }
     }
 
-    if (env.coastalsource_kv) {
-      await env.coastalsource_kv.put(`engagement_seen:${engagementId}`, id, {
-        expirationTtl: 60 * 60 * 24 * 7,
-      });
+    // Dispatch the Desk ticket if enabled and we still own this engagement
+    // (a racing duplicate webhook may have overwritten the seen-key after us).
+    if (
+      deskTicketPayload &&
+      env.DESK_AUTO_CREATE_TICKETS === "true"
+    ) {
+      let ownsDispatch = true;
+      if (env.coastalsource_kv) {
+        const currentOwner = await env.coastalsource_kv.get(
+          `engagement_seen:${engagementId}`
+        );
+        if (currentOwner && currentOwner !== id) {
+          ownsDispatch = false;
+          deskTicketError = `dispatch skipped — another webhook (${currentOwner}) owns this engagement`;
+          console.log(deskTicketError);
+        }
+      }
+
+      if (ownsDispatch) {
+        try {
+          const zohoToken = await getZohoAccessToken(env);
+          const result = await callZohoDesk(env, zohoToken, "/tickets", {
+            method: "POST",
+            body: deskTicketPayload.body,
+          });
+          deskTicketId = result?.id || null;
+          deskTicketDispatched = true;
+          console.log("Desk ticket created:", deskTicketId);
+        } catch (err) {
+          deskTicketDispatched = false;
+          const errBody = err?.details ? ` | ${JSON.stringify(err.details)}` : "";
+          deskTicketError = `${String(err?.message || err)}${errBody}`;
+          console.log("Desk ticket dispatch failed:", deskTicketError);
+        }
+      }
     }
   }
 
@@ -273,7 +314,8 @@ async function processEngagementWebhook(env, data) {
       : null,
     desk_ticket_payload: deskTicketPayload,
     desk_ticket_error: deskTicketError,
-    desk_ticket_dispatched: false,
+    desk_ticket_dispatched: deskTicketDispatched,
+    desk_ticket_id: deskTicketId,
   };
 
   console.log("Zoom webhook processed:", JSON.stringify(record));
