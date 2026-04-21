@@ -102,8 +102,7 @@ async function handleWebhookCatch(request, env, ctx, url) {
     parsedBody = null;
   }
 
-  // Zoom URL validation challenge — respond with HMAC-SHA256 of plainToken.
-  // This event is sent during setup only; no signature verification needed.
+  // URL validation challenge — must respond synchronously with the encrypted token.
   if (
     parsedBody?.event === "endpoint.url_validation" &&
     parsedBody?.payload?.plainToken
@@ -116,7 +115,7 @@ async function handleWebhookCatch(request, env, ctx, url) {
     return json({ plainToken, encryptedToken });
   }
 
-  // Verify x-zm-signature on real events.
+  // Verify signature synchronously so invalid requests still get rejected fast.
   const sigResult = await verifyZoomSignature(request, rawBody, env);
   if (!sigResult.ok) {
     console.log("Zoom signature verification failed:", sigResult.reason);
@@ -132,13 +131,43 @@ async function handleWebhookCatch(request, env, ctx, url) {
   const receivedAt = new Date().toISOString();
   const id = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
 
+  // Hand off the heavy work (engagement fetch, Zoho lookup, owner resolution,
+  // storage) to run in the background so Zoom gets an immediate 200.
+  ctx.waitUntil(
+    processEngagementWebhook(env, {
+      id,
+      receivedAt,
+      method: request.method,
+      path: url.pathname,
+      query,
+      headers,
+      rawBody,
+      parsedBody,
+    }).catch((err) => {
+      console.log("processEngagementWebhook failed:", String(err?.message || err));
+    })
+  );
+
+  return json({ ok: true, id });
+}
+
+async function processEngagementWebhook(env, data) {
+  const {
+    id,
+    receivedAt,
+    method,
+    path,
+    query,
+    headers,
+    rawBody,
+    parsedBody,
+  } = data;
+
   const eventName = parsedBody?.event;
   const engagementId = parsedBody?.payload?.object?.engagement_id;
   const isEngagementReady =
     eventName === "contact_center.cx_engagement_end_data_ready" && engagementId;
 
-  // Idempotency: if we've already processed this engagement_id, mark this
-  // webhook as a duplicate and skip the expensive downstream work.
   let duplicateOf = null;
   if (isEngagementReady && env.coastalsource_kv) {
     duplicateOf = await env.coastalsource_kv.get(`engagement_seen:${engagementId}`);
@@ -147,8 +176,8 @@ async function handleWebhookCatch(request, env, ctx, url) {
   let engagementDetails = null;
   let engagementFetchError = null;
   let phoneLookupResult = null;
+  let ownerResolution = null;
   let zohoCreatePayload = null;
-  let zohoCreateDispatched = false;
 
   if (isEngagementReady && !duplicateOf) {
     try {
@@ -162,15 +191,31 @@ async function handleWebhookCatch(request, env, ctx, url) {
     if (callerPhone) {
       try {
         phoneLookupResult = await lookupZohoByPhone(env, callerPhone);
-        if (!phoneLookupResult.found) {
-          zohoCreatePayload = buildZohoContactCreatePayload({
-            phone: callerPhone,
-            engagementId,
-            receivedAt,
-          });
-        }
       } catch (err) {
         console.log("Zoho phone lookup failed:", String(err?.message || err));
+      }
+
+      if (phoneLookupResult && !phoneLookupResult.found) {
+        const agentUserId = extractPrimaryAgentId(engagementDetails);
+        if (agentUserId) {
+          try {
+            ownerResolution = await resolveZohoOwnerForZoomAgent(env, agentUserId);
+          } catch (err) {
+            ownerResolution = {
+              zoom_user_id: agentUserId,
+              zoho_user_id: null,
+              error: String(err?.message || err),
+            };
+            console.log("Owner resolution failed:", ownerResolution.error);
+          }
+        }
+
+        zohoCreatePayload = buildZohoContactCreatePayload({
+          phone: callerPhone,
+          engagementId,
+          receivedAt,
+          ownerId: ownerResolution?.zoho_user_id || null,
+        });
       }
     }
 
@@ -184,8 +229,8 @@ async function handleWebhookCatch(request, env, ctx, url) {
   const record = {
     id,
     received_at: receivedAt,
-    method: request.method,
-    path: url.pathname,
+    method,
+    path,
     query,
     headers,
     raw_body: rawBody,
@@ -194,19 +239,92 @@ async function handleWebhookCatch(request, env, ctx, url) {
     engagement_details: engagementDetails,
     engagement_fetch_error: engagementFetchError,
     phone_lookup_result: phoneLookupResult,
+    owner_resolution: ownerResolution,
     zoho_create_payload: zohoCreatePayload,
-    zoho_create_dispatched: zohoCreateDispatched,
+    zoho_create_dispatched: false,
   };
 
-  console.log("Zoom webhook received:", JSON.stringify(record));
+  console.log("Zoom webhook processed:", JSON.stringify(record));
 
   if (env.coastalsource_kv) {
     await env.coastalsource_kv.put(`webhook:${id}`, JSON.stringify(record), {
-      expirationTtl: 60 * 60 * 24 * 7, // 7 days
+      expirationTtl: 60 * 60 * 24 * 7,
     });
   }
+}
 
-  return json({ ok: true, id, duplicate_of: duplicateOf });
+function extractPrimaryAgentId(engagementDetails) {
+  if (Array.isArray(engagementDetails?.agents) && engagementDetails.agents.length > 0) {
+    const a = engagementDetails.agents[0];
+    if (a?.user_id) return a.user_id;
+  }
+  const events = engagementDetails?.events || [];
+  const accept = events.find((e) => e?.event_type === "Agent Accept" && e?.user_id);
+  return accept?.user_id || null;
+}
+
+async function resolveZohoOwnerForZoomAgent(env, zoomUserId) {
+  const cacheKey = `zoom_to_zoho_user:${zoomUserId}`;
+  if (env.coastalsource_kv) {
+    const cached = await env.coastalsource_kv.get(cacheKey, { type: "json" });
+    if (cached?.zoho_user_id) {
+      return { ...cached, source: "cache" };
+    }
+  }
+
+  const zoomToken = await getZoomAccessToken(env);
+  const zoomRes = await fetch(
+    `https://api.zoom.us/v2/users/${encodeURIComponent(zoomUserId)}`,
+    { headers: { Authorization: `Bearer ${zoomToken}` } }
+  );
+  const zoomText = await zoomRes.text();
+  let zoomUser = null;
+  try {
+    zoomUser = zoomText ? JSON.parse(zoomText) : null;
+  } catch {
+    zoomUser = null;
+  }
+  if (!zoomRes.ok) {
+    throw new Error(`Zoom user lookup failed: ${zoomRes.status} ${zoomText?.slice(0, 200)}`);
+  }
+  const email = zoomUser?.email || null;
+  if (!email) {
+    return { zoom_user_id: zoomUserId, email: null, zoho_user_id: null, error: "Zoom user has no email" };
+  }
+
+  const zohoUserId = await findZohoUserByEmail(env, email);
+  const result = {
+    zoom_user_id: zoomUserId,
+    email,
+    zoho_user_id: zohoUserId,
+    source: "fresh",
+  };
+
+  if (zohoUserId && env.coastalsource_kv) {
+    await env.coastalsource_kv.put(
+      cacheKey,
+      JSON.stringify({ zoom_user_id: zoomUserId, email, zoho_user_id: zohoUserId }),
+      { expirationTtl: 60 * 60 * 24 * 30 }
+    );
+  }
+
+  return result;
+}
+
+async function findZohoUserByEmail(env, email) {
+  const token = await getZohoAccessToken(env);
+  const target = email.toLowerCase();
+  const perPage = 200;
+  for (let page = 1; page <= 10; page++) {
+    const zohoUrl =
+      `https://www.zohoapis.com/crm/v2/users?type=AllUsers&page=${page}&per_page=${perPage}`;
+    const data = await callZoho(env, token, zohoUrl);
+    const users = Array.isArray(data?.users) ? data.users : [];
+    const match = users.find((u) => (u?.email || "").toLowerCase() === target);
+    if (match) return match.id;
+    if (!data?.info?.more_records) return null;
+  }
+  return null;
 }
 
 async function verifyZoomSignature(request, rawBody, env) {
