@@ -212,11 +212,11 @@ async function processEngagementWebhook(env, data) {
 
   const eventName = parsedBody?.event;
   const engagementId = parsedBody?.payload?.object?.engagement_id;
-  const isEngagementReady =
-    eventName === "contact_center.cx_engagement_end_data_ready" && engagementId;
+  const isDispositionEvent =
+    eventName === "contact_center.engagement_disposition_added" && engagementId;
 
   let duplicateOf = null;
-  if (isEngagementReady && env.coastalsource_kv) {
+  if (isDispositionEvent && env.coastalsource_kv) {
     duplicateOf = await env.coastalsource_kv.get(`engagement_seen:${engagementId}`);
   }
 
@@ -231,7 +231,7 @@ async function processEngagementWebhook(env, data) {
   let deskTicketDispatched = false;
   let deskTicketId = null;
 
-  if (isEngagementReady && !duplicateOf) {
+  if (isDispositionEvent && !duplicateOf) {
     // Claim this engagement immediately so a racing concurrent webhook
     // overwrites this key and the later ownership re-check kicks it out.
     if (env.coastalsource_kv) {
@@ -247,11 +247,18 @@ async function processEngagementWebhook(env, data) {
       console.log("Zoom engagement fetch failed:", engagementFetchError);
     }
 
-    // Zoom fires cx_engagement_end_data_ready as soon as the call ends — typically
-    // before the agent finishes wrap-up. Poll until either a disposition is set or
-    // wrap-up has demonstrably completed so we don't skip tickets prematurely.
-    if (engagementDetails) {
-      engagementDetails = await pollForEngagementDisposition(env, engagementId, engagementDetails);
+    // Merge the disposition the webhook just told us about into engagement_details
+    // if the fetch hasn't surfaced it yet (eventual-consistency safety net).
+    const webhookDisposition = parsedBody?.payload?.object?.disposition_id
+      ? {
+          disposition_id: parsedBody.payload.object.disposition_id,
+          disposition_name: parsedBody.payload.object.disposition_name,
+        }
+      : null;
+    if (engagementDetails && webhookDisposition) {
+      if (!Array.isArray(engagementDetails.dispositions) || engagementDetails.dispositions.length === 0) {
+        engagementDetails.dispositions = [webhookDisposition];
+      }
     }
 
     const callerPhone = engagementDetails?.consumers?.[0]?.consumer_number || null;
@@ -387,42 +394,6 @@ async function processEngagementWebhook(env, data) {
       expirationTtl: 60 * 60 * 24 * 7,
     });
   }
-}
-
-async function pollForEngagementDisposition(env, engagementId, initial) {
-  const maxWaitMs = 120000; // 2 minutes total
-  const intervalMs = 15000; // 15 seconds between polls
-  let details = initial;
-
-  if (Array.isArray(details?.dispositions) && details.dispositions.length > 0) {
-    return details;
-  }
-  if (details?.wrap_up_duration > 0) {
-    // Wrap-up already finished but no disposition — agent skipped it.
-    return details;
-  }
-
-  console.log(`Polling engagement ${engagementId} for disposition...`);
-  const start = Date.now();
-  while (Date.now() - start < maxWaitMs) {
-    await new Promise((r) => setTimeout(r, intervalMs));
-    try {
-      const refreshed = await fetchZoomEngagement(env, engagementId);
-      if (refreshed) details = refreshed;
-      if (Array.isArray(details?.dispositions) && details.dispositions.length > 0) {
-        console.log(`Disposition found after ${Date.now() - start}ms`);
-        return details;
-      }
-      if (details?.wrap_up_duration > 0) {
-        console.log(`Wrap-up completed without disposition after ${Date.now() - start}ms`);
-        return details;
-      }
-    } catch (err) {
-      console.log("Disposition poll fetch failed:", String(err?.message || err));
-    }
-  }
-  console.log(`Gave up polling for disposition after ${maxWaitMs}ms`);
-  return details;
 }
 
 function extractPrimaryAgentId(engagementDetails) {
