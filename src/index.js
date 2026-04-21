@@ -50,7 +50,12 @@ async function handleZohoRoutes(request, env, ctx, url) {
 async function handleZoomRoutes(request, env, ctx, url) {
   // Webhook catcher — Zoom POSTs here. Unauthenticated for now so we can
   // observe what headers Zoom actually sends; lock down once known.
-  if (url.pathname === "/zoom/engagement-webhook" && request.method === "POST") {
+  const catcherPaths = new Set([
+    "/zoom/engagement-webhook",
+    "/zoom/webhooks",
+    "/zoom/webhooks/",
+  ]);
+  if (request.method === "POST" && catcherPaths.has(url.pathname)) {
     return handleWebhookCatch(request, env, ctx, url);
   }
 
