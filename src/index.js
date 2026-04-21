@@ -205,8 +205,10 @@ async function processEngagementWebhook(env, data) {
               zoom_user_id: agentUserId,
               zoho_user_id: null,
               error: String(err?.message || err),
+              error_status: err?.status ?? null,
+              error_details: err?.details ?? null,
             };
-            console.log("Owner resolution failed:", ownerResolution.error);
+            console.log("Owner resolution failed:", JSON.stringify(ownerResolution));
           }
         }
 
