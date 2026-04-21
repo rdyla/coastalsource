@@ -1285,9 +1285,6 @@ function buildDeskTicketPayload({
   departmentId,
 }) {
   const contactName = phoneLookup?.contact?.name || "Unknown Caller";
-  const nowLocal = new Date().toISOString().replace("T", " ").slice(0, 16);
-  const subject = `Inbound call from ${contactName} — ${nowLocal}`;
-
   const agent = engagementDetails?.agents?.[0];
   const queue = engagementDetails?.queues?.[0];
 
@@ -1299,34 +1296,44 @@ function buildDeskTicketPayload({
     .filter(Boolean)
     .join(", ");
 
-  const descLines = [
-    `Engagement ID: ${engagementDetails?.engagement_id ?? "-"}`,
-    `Phone: ${phone}`,
-    `Direction: ${engagementDetails?.direction ?? "-"}`,
-    agent ? `Agent: ${agent.display_name || "-"}` : null,
-    queue ? `Queue: ${queue.queue_name}` : null,
-    dispositionNames ? `Disposition: ${dispositionNames}` : null,
-    `Start: ${engagementDetails?.start_time ?? "-"}`,
-    `End: ${engagementDetails?.end_time ?? "-"}`,
-    `Talk duration: ${engagementDetails?.talk_duration ?? "-"}s`,
-    `Handling duration: ${engagementDetails?.handling_duration ?? "-"}s`,
-  ].filter(Boolean);
-
   const notes = Array.isArray(engagementDetails?.notes) ? engagementDetails.notes : [];
+
+  // Subject: "<disposition> — <first note excerpt>" (note truncated at 80 chars)
+  let subject = dispositionNames || "Inbound call";
+  if (notes.length > 0 && notes[0]?.note) {
+    const noteText = String(notes[0].note).trim();
+    const excerpt = noteText.length > 80 ? noteText.slice(0, 77) + "..." : noteText;
+    subject = `${subject} — ${excerpt}`;
+  }
+
+  // Description: Zoho Desk renders this field as HTML, so use <br> for line breaks
+  // and escape user-supplied values to prevent any HTML injection.
+  const lines = [];
+  lines.push(`<b>Engagement ID:</b> ${escapeHtml(engagementDetails?.engagement_id ?? "-")}`);
+  lines.push(`<b>Phone:</b> ${escapeHtml(phone)}`);
+  lines.push(`<b>Direction:</b> ${escapeHtml(engagementDetails?.direction ?? "-")}`);
+  if (agent) lines.push(`<b>Agent:</b> ${escapeHtml(agent.display_name || "-")}`);
+  if (queue) lines.push(`<b>Queue:</b> ${escapeHtml(queue.queue_name)}`);
+  if (dispositionNames) lines.push(`<b>Disposition:</b> ${escapeHtml(dispositionNames)}`);
+  lines.push(`<b>Start:</b> ${escapeHtml(engagementDetails?.start_time ?? "-")}`);
+  lines.push(`<b>End:</b> ${escapeHtml(engagementDetails?.end_time ?? "-")}`);
+  lines.push(`<b>Talk duration:</b> ${escapeHtml(String(engagementDetails?.talk_duration ?? "-"))}s`);
+  lines.push(`<b>Handling duration:</b> ${escapeHtml(String(engagementDetails?.handling_duration ?? "-"))}s`);
+
   if (notes.length > 0) {
     const userMap = buildUserDisplayNameMap(engagementDetails);
-    descLines.push("");
-    descLines.push("Agent notes:");
+    lines.push("");
+    lines.push("<b>Agent notes:</b>");
     for (const n of notes) {
       const author = userMap[n.user_id] || n.user_id || "Unknown";
       const ts = n.last_modified_time ? `, ${n.last_modified_time}` : "";
-      descLines.push(`- ${n.note} (${author}${ts})`);
+      lines.push(`- ${escapeHtml(n.note)} (${escapeHtml(author)}${escapeHtml(ts)})`);
     }
   }
 
   const ticket = {
     subject,
-    description: descLines.join("\n"),
+    description: lines.join("<br>"),
     departmentId: String(departmentId),
     channel: "Phone",
     phone,
