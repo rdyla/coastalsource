@@ -1375,7 +1375,40 @@ async function handlePopupRoutes(request, env, ctx, url) {
   if (url.pathname === "/popup/submit" && request.method === "POST") {
     return handlePopupSubmit(request, env);
   }
+  if (url.pathname === "/popup/accounts/search" && request.method === "GET") {
+    return handlePopupAccountsSearch(env, url);
+  }
   return htmlResponse("<h1>Not Found</h1>", 404);
+}
+
+async function handlePopupAccountsSearch(env, url) {
+  const q = (url.searchParams.get("q") || "").trim();
+  const token = url.searchParams.get("token") || "";
+  const phone = url.searchParams.get("phone") || "";
+  const engagementId = url.searchParams.get("engagement_id") || "";
+  const expiresAt = Number(url.searchParams.get("expires_at") || 0);
+
+  if (q.length < 2) return json({ accounts: [] });
+
+  const valid = await verifyPopupToken(env, phone, engagementId, expiresAt, token);
+  if (!valid) return json({ error: "Unauthorized" }, 403);
+
+  try {
+    const accessToken = await getZohoAccessToken(env);
+    const criteria = `(Account_Name:starts_with:${q})`;
+    const zohoUrl =
+      `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=` +
+      encodeURIComponent(criteria) +
+      `&per_page=15`;
+    const data = await callZoho(env, accessToken, zohoUrl);
+    const accounts = Array.isArray(data?.data)
+      ? data.data.map((a) => ({ id: a.id, name: a.Account_Name }))
+      : [];
+    return json({ accounts });
+  } catch (err) {
+    // No-match search throws in callZoho on non-OK Zoho responses. Return empty set.
+    return json({ accounts: [] });
+  }
 }
 
 async function handlePopupEntry(env, url) {
@@ -1436,10 +1469,11 @@ async function handlePopupSubmit(request, env) {
   const lastName = String(form.get("last_name") || "").trim() || "Unknown Caller";
   const email = String(form.get("email") || "").trim();
   const company = String(form.get("company") || "").trim();
+  const accountId = String(form.get("account_id") || "").trim();
   const notes = String(form.get("notes") || "").trim();
 
-  // Dedupe — if someone else (webhook, another popup) already created this contact,
-  // skip the write and go straight to the search page.
+  // Dedupe — if a contact already exists for this phone we'd rather surface
+  // it than create a duplicate. Leads are free to proliferate so no lead dedupe.
   try {
     const existing = await lookupZohoByPhone(env, phone);
     if (existing.found && existing.match_type === "contact" && existing.contact?.id) {
@@ -1453,8 +1487,12 @@ async function handlePopupSubmit(request, env) {
   if (engagementId) {
     descParts.push(`Created from Zoom engagement ${engagementId} on ${new Date().toISOString()}`);
   }
-  if (company) descParts.push(`Company: ${company}`);
   if (notes) descParts.push(`Notes: ${notes}`);
+
+  // Branch: an account_id from the picker means we're adding a contact to an
+  // existing account. No account means this is a net-new prospect — create a Lead
+  // so it lands in the sales pipeline rather than hanging off no account.
+  const targetModule = accountId ? "Contacts" : "Leads";
 
   const record = {
     Last_Name: lastName,
@@ -1465,15 +1503,24 @@ async function handlePopupSubmit(request, env) {
   if (email) record.Email = email;
   if (descParts.length) record.Description = descParts.join("\n");
 
+  if (targetModule === "Contacts") {
+    record.Account_Name = { id: accountId };
+  } else {
+    record.Company = company || "Unknown Company";
+  }
+
   const zohoToken = await getZohoAccessToken(env);
-  const zohoRes = await fetch("https://www.zohoapis.com/crm/v2/Contacts", {
-    method: "POST",
-    headers: {
-      Authorization: `Zoho-oauthtoken ${zohoToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ data: [record] }),
-  });
+  const zohoRes = await fetch(
+    `https://www.zohoapis.com/crm/v2/${targetModule}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Zoho-oauthtoken ${zohoToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ data: [record] }),
+    }
+  );
   const text = await zohoRes.text();
   let body = null;
   try {
@@ -1484,17 +1531,22 @@ async function handlePopupSubmit(request, env) {
 
   if (!zohoRes.ok || body?.data?.[0]?.status !== "success") {
     return htmlResponse(
-      `<h1>Zoho create failed</h1>
-       <p>The contact was not created. Details below:</p>
+      `<h1>Zoho ${escapeHtml(targetModule)} create failed</h1>
+       <p>The record was not created. Details below:</p>
        <pre>${escapeHtml(JSON.stringify(body, null, 2))}</pre>
        <p><a href="javascript:history.back()">Go back</a></p>`,
       502
     );
   }
 
-  const newContactId = body?.data?.[0]?.details?.id;
-  if (newContactId) {
-    return Response.redirect(zohoContactDetailUrl(newContactId), 302);
+  const newId = body?.data?.[0]?.details?.id;
+  if (newId) {
+    return Response.redirect(
+      targetModule === "Contacts"
+        ? zohoContactDetailUrl(newId)
+        : zohoLeadDetailUrl(newId),
+      302
+    );
   }
   return Response.redirect(zohoSearchUrl(normalizePhoneForSearch(phone)), 302);
 }
@@ -1509,6 +1561,10 @@ function zohoContactDetailUrl(contactId) {
 
 function zohoAccountDetailUrl(accountId) {
   return `${ZOHO_CRM_PLUS_BASE}/tab/Accounts/${encodeURIComponent(accountId)}`;
+}
+
+function zohoLeadDetailUrl(leadId) {
+  return `${ZOHO_CRM_PLUS_BASE}/tab/Leads/${encodeURIComponent(leadId)}`;
 }
 
 function normalizePhoneForSearch(phoneRaw) {
@@ -1558,7 +1614,7 @@ function renderCreateForm({ phone, engagementId, token, expiresAt }) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Create Contact</title>
+<title>Create Contact or Lead</title>
 <style>
   body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; max-width: 540px; margin: 30px auto; padding: 0 20px; color: #222; }
   h1 { font-size: 20px; margin-bottom: 8px; }
@@ -1575,13 +1631,22 @@ function renderCreateForm({ phone, engagementId, token, expiresAt }) {
   button:disabled { background: #888; cursor: not-allowed; }
   .cancel { background: #e0e4e8; color: #333; margin-left: 8px; }
   .cancel:hover { background: #c8ccd0; }
+  .account-picker { position: relative; }
+  .suggestions { position: absolute; top: 100%; left: 0; right: 0; background: #fff; border: 1px solid #c0c4c9; border-radius: 4px; max-height: 200px; overflow-y: auto; margin-top: 2px; z-index: 10; box-shadow: 0 4px 8px rgba(0,0,0,0.08); }
+  .suggestion { padding: 8px 10px; cursor: pointer; font-size: 14px; }
+  .suggestion:hover { background: #eef4fb; }
+  .account-picker.selected input { background: #e6f4ea; border-color: #6bbf80; }
+  .hint { font-size: 12px; color: #666; margin-top: 6px; }
+  #target-indicator { font-size: 12px; font-weight: 600; margin-top: 6px; color: #0066cc; }
+  #target-indicator.lead { color: #a25900; }
 </style>
 </head>
 <body>
-  <h1>Create new contact</h1>
+  <h1>Create new contact or lead</h1>
   <div class="info">
     No existing Zoho contact was found for <strong>${esc(phone)}</strong>.
-    Fill in what you know and we'll create the contact now.
+    Pick an existing account below to add a <strong>Contact</strong>, or leave the
+    account blank (optionally entering a company name) to create a <strong>Lead</strong>.
   </div>
   <form method="POST" action="/popup/submit">
     <input type="hidden" name="phone" value="${esc(phone)}">
@@ -1603,23 +1668,116 @@ function renderCreateForm({ phone, engagementId, token, expiresAt }) {
     <label for="email">Email</label>
     <input id="email" name="email" type="email" autocomplete="email">
 
-    <label for="company">Company</label>
-    <input id="company" name="company">
+    <label for="account_search">Account / Company</label>
+    <div class="account-picker" id="account_picker">
+      <input id="account_search" name="company" autocomplete="off" placeholder="Type to search existing accounts">
+      <input type="hidden" name="account_id" id="account_id_hidden">
+      <div id="account_suggestions" class="suggestions" hidden></div>
+    </div>
+    <div class="hint">Pick from the dropdown to add this person as a contact on an existing account. Leave blank or type a company name (no match) to create a lead instead.</div>
+    <div id="target-indicator" class="lead">Target: Lead</div>
 
     <label for="notes">Notes</label>
     <textarea id="notes" name="notes" rows="3"></textarea>
 
     <div class="actions">
-      <button type="submit" id="submit-btn">Create Contact</button>
+      <button type="submit" id="submit-btn">Create</button>
       <button type="button" class="cancel" onclick="window.close()">Cancel</button>
     </div>
   </form>
   <script>
-    document.querySelector('form').addEventListener('submit', function () {
-      var btn = document.getElementById('submit-btn');
-      btn.disabled = true;
-      btn.textContent = 'Creating...';
-    });
+    (function () {
+      var PHONE = ${JSON.stringify(phone)};
+      var ENGAGEMENT_ID = ${JSON.stringify(engagementId)};
+      var TOKEN = ${JSON.stringify(token)};
+      var EXPIRES_AT = ${JSON.stringify(String(expiresAt))};
+
+      var picker = document.getElementById('account_picker');
+      var searchInput = document.getElementById('account_search');
+      var accountIdHidden = document.getElementById('account_id_hidden');
+      var suggestions = document.getElementById('account_suggestions');
+      var targetIndicator = document.getElementById('target-indicator');
+      var submitBtn = document.getElementById('submit-btn');
+
+      function updateTarget() {
+        if (accountIdHidden.value) {
+          targetIndicator.textContent = 'Target: Contact on selected account';
+          targetIndicator.classList.remove('lead');
+          submitBtn.textContent = 'Create Contact';
+        } else {
+          targetIndicator.textContent = 'Target: Lead';
+          targetIndicator.classList.add('lead');
+          submitBtn.textContent = 'Create Lead';
+        }
+      }
+
+      function clearSuggestions() {
+        suggestions.innerHTML = '';
+        suggestions.hidden = true;
+      }
+
+      function renderSuggestions(accounts) {
+        suggestions.innerHTML = '';
+        if (!accounts.length) {
+          var empty = document.createElement('div');
+          empty.className = 'suggestion';
+          empty.style.color = '#888';
+          empty.style.cursor = 'default';
+          empty.textContent = 'No match — will create a Lead';
+          suggestions.appendChild(empty);
+        } else {
+          accounts.forEach(function (a) {
+            var div = document.createElement('div');
+            div.className = 'suggestion';
+            div.textContent = a.name;
+            div.addEventListener('mousedown', function (e) {
+              // mousedown to fire before blur
+              e.preventDefault();
+              searchInput.value = a.name;
+              accountIdHidden.value = a.id;
+              picker.classList.add('selected');
+              clearSuggestions();
+              updateTarget();
+            });
+            suggestions.appendChild(div);
+          });
+        }
+        suggestions.hidden = false;
+      }
+
+      var debounceTimer;
+      searchInput.addEventListener('input', function () {
+        accountIdHidden.value = '';
+        picker.classList.remove('selected');
+        updateTarget();
+        clearTimeout(debounceTimer);
+        var q = searchInput.value.trim();
+        if (q.length < 2) { clearSuggestions(); return; }
+        debounceTimer = setTimeout(function () { searchAccounts(q); }, 250);
+      });
+
+      searchInput.addEventListener('blur', function () {
+        setTimeout(clearSuggestions, 150);
+      });
+
+      function searchAccounts(q) {
+        var params = new URLSearchParams({
+          q: q, token: TOKEN, phone: PHONE,
+          engagement_id: ENGAGEMENT_ID, expires_at: EXPIRES_AT
+        });
+        fetch('/popup/accounts/search?' + params.toString())
+          .then(function (r) { return r.json(); })
+          .then(function (data) { renderSuggestions(data.accounts || []); })
+          .catch(function (err) { console.error('account search failed', err); });
+      }
+
+      document.querySelector('form').addEventListener('submit', function () {
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Creating...';
+      });
+
+      updateTarget();
+    })();
   </script>
 </body>
 </html>`;
