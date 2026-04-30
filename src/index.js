@@ -331,7 +331,9 @@ async function processEngagementWebhook(env, data) {
           engagementDetails?.dispositions?.[0]?.disposition_name || null;
         const inquiryField = buildInquiryTypeCustomField(engagementDetails);
 
-        if (!departmentId) {
+        if (shouldSkipTicket(primaryDispName)) {
+          deskTicketError = `disposition '${primaryDispName}' — ticket creation intentionally skipped`;
+        } else if (!departmentId) {
           deskTicketError = "no department mapping for queue/flow";
         } else if (!inquiryField) {
           deskTicketError = `no inquiry type mapping for disposition: ${primaryDispName}`;
@@ -1420,6 +1422,17 @@ const DESK_INQUIRY_TYPE_MAP = {
   "Rollover": "Rollover",
   "Set-up or diagnostics": "Setup or diagnostics - Tech Support",
 };
+
+// Dispositions that explicitly mean "do not create a ticket" — agents pick
+// these when the call was resolved on the spot or doesn't warrant follow-up.
+// Match case-insensitively so "no ticket needed" / "No Ticket Needed" / etc.
+// all skip cleanly.
+const SKIP_TICKET_DISPOSITIONS = new Set(["no ticket needed"]);
+
+function shouldSkipTicket(dispositionName) {
+  if (!dispositionName) return false;
+  return SKIP_TICKET_DISPOSITIONS.has(String(dispositionName).toLowerCase().trim());
+}
 
 function mapDispositionToInquiryType(dispositionName) {
   if (!dispositionName) return null;
