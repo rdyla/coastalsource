@@ -1417,6 +1417,7 @@ const DESK_INQUIRY_TYPE_MAP = {
   "Order Management & Shipping": "Order and Shipping – Warehouse and Shipping",
   "Product/Account Support": "Product/Service Support – Customer Service",
   "Returns/Exchanges": "Returns/Exchanges – Warehouse and Shipping",
+  "Rollover": "Rollover",
   "Set-up or diagnostics": "Setup or diagnostics - Tech Support",
 };
 
