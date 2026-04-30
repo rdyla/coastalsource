@@ -35,6 +35,7 @@ async function handleZohoRoutes(request, env, ctx, url) {
     "GET /zoho/account-summary": handleAccountSummary,
     "GET /zoho/lookup-by-phone": handleLookupByPhone,
     "POST /zoho/create-contact": handleCreateContact,
+    "GET /zoho/desk/agents": handleDeskAgentsProbe,
   };
 
   const handler = routes[`${request.method} ${url.pathname}`];
@@ -456,27 +457,44 @@ async function resolveZohoOwnerForZoomAgent(env, zoomUserId) {
   }
 
   // Resolve CRM user and Desk agent in parallel — separate user pools per product.
+  // Capture each lookup's outcome (id or error) so the result record surfaces
+  // why a lookup failed instead of silently going null.
   const zohoToken = await getZohoAccessToken(env);
-  const [zohoUserId, zohoDeskUserId] = await Promise.all([
-    findZohoUserByEmail(env, email).catch((e) => {
-      console.log("CRM user lookup failed:", String(e?.message || e));
-      return null;
-    }),
-    findZohoDeskAgentByEmail(env, zohoToken, email).catch((e) => {
-      console.log("Desk agent lookup failed:", String(e?.message || e));
-      return null;
-    }),
+  const wrap = (p) =>
+    p.then((id) => ({ ok: true, id })).catch((e) => ({ ok: false, error: e }));
+
+  const [crmRes, deskRes] = await Promise.all([
+    wrap(findZohoUserByEmail(env, email)),
+    wrap(findZohoDeskAgentByEmail(env, zohoToken, email)),
   ]);
+
+  const zohoUserId = crmRes.ok ? crmRes.id : null;
+  const zohoDeskUserId = deskRes.ok ? deskRes.id : null;
+  const deskAgentLookupError = deskRes.ok
+    ? null
+    : {
+        message: String(deskRes.error?.message || deskRes.error),
+        status: deskRes.error?.status ?? null,
+        details: deskRes.error?.details ?? null,
+      };
+
+  if (deskAgentLookupError) {
+    console.log("Desk agent lookup failed:", JSON.stringify(deskAgentLookupError));
+  }
 
   const result = {
     zoom_user_id: zoomUserId,
     email,
     zoho_user_id: zohoUserId,
     zoho_desk_user_id: zohoDeskUserId,
+    desk_agent_lookup_error: deskAgentLookupError,
     source: "fresh",
   };
 
-  if ((zohoUserId || zohoDeskUserId) && env.coastalsource_kv) {
+  // Only cache when neither lookup errored — we want to retry on transient
+  // permission issues rather than freeze a bad result for 30 days.
+  const noErrors = crmRes.ok && deskRes.ok;
+  if (noErrors && (zohoUserId || zohoDeskUserId) && env.coastalsource_kv) {
     await env.coastalsource_kv.put(
       cacheKey,
       JSON.stringify({
@@ -638,6 +656,42 @@ async function handleLookupByPhone(request, env, ctx, url) {
   const phoneRaw = url.searchParams.get("phone");
   if (!phoneRaw) return json({ error: "Missing query param", required: ["phone"] }, 400);
   return json(await lookupZohoByPhone(env, phoneRaw));
+}
+
+async function handleDeskAgentsProbe(request, env, ctx, url) {
+  const email = (url.searchParams.get("email") || "").trim().toLowerCase();
+  const accessToken = await getZohoAccessToken(env);
+  try {
+    const data = await callZohoDesk(env, accessToken, `/agents?from=0&limit=100`);
+    const agents = Array.isArray(data?.data) ? data.data : [];
+    const match = email
+      ? agents.find(
+          (a) => (a?.emailId || a?.email || "").toLowerCase() === email
+        ) || null
+      : null;
+    return json({
+      ok: true,
+      count: agents.length,
+      first_5: agents.slice(0, 5).map((a) => ({
+        id: a.id,
+        emailId: a.emailId ?? null,
+        email: a.email ?? null,
+        firstName: a.firstName ?? null,
+        lastName: a.lastName ?? null,
+      })),
+      match,
+    });
+  } catch (err) {
+    return json(
+      {
+        ok: false,
+        status: err?.status ?? null,
+        error: String(err?.message || err),
+        details: err?.details ?? null,
+      },
+      200
+    );
+  }
 }
 
 async function handleCreateContact(request, env, ctx, url) {
@@ -1257,16 +1311,12 @@ async function callZohoDesk(env, accessToken, path, options = {}) {
 async function findZohoDeskAgentByEmail(env, accessToken, email) {
   const target = String(email || "").toLowerCase();
   if (!target) return null;
-  // Desk pagination uses from/limit (not page/per_page like CRM).
+  // Desk pagination uses from/limit (not page/per_page like CRM). Errors
+  // bubble up so resolveZohoOwnerForZoomAgent can capture them in the
+  // ownerResolution record (helpful for diagnosing scope/permission issues).
   const limit = 100;
   for (let from = 0; from < 1000; from += limit) {
-    let data;
-    try {
-      data = await callZohoDesk(env, accessToken, `/agents?from=${from}&limit=${limit}`);
-    } catch (err) {
-      console.log(`Desk agent listing (from=${from}) failed:`, String(err?.message || err));
-      return null;
-    }
+    const data = await callZohoDesk(env, accessToken, `/agents?from=${from}&limit=${limit}`);
     const agents = Array.isArray(data?.data) ? data.data : [];
     const match = agents.find(
       (a) => (a?.emailId || a?.email || "").toLowerCase() === target
