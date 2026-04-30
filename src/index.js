@@ -269,23 +269,27 @@ async function processEngagementWebhook(env, data) {
         console.log("Zoho phone lookup failed:", String(err?.message || err));
       }
 
-      if (phoneLookupResult && !phoneLookupResult.found) {
-        const agentUserId = extractPrimaryAgentId(engagementDetails);
-        if (agentUserId) {
-          try {
-            ownerResolution = await resolveZohoOwnerForZoomAgent(env, agentUserId);
-          } catch (err) {
-            ownerResolution = {
-              zoom_user_id: agentUserId,
-              zoho_user_id: null,
-              error: String(err?.message || err),
-              error_status: err?.status ?? null,
-              error_details: err?.details ?? null,
-            };
-            console.log("Owner resolution failed:", JSON.stringify(ownerResolution));
-          }
+      // Resolve the Zoom agent to Zoho identities (CRM user + Desk agent) once,
+      // regardless of whether we end up creating a contact or a ticket — both
+      // paths benefit from the mapping and we cache the result for 30 days.
+      const agentUserId = extractPrimaryAgentId(engagementDetails);
+      if (agentUserId) {
+        try {
+          ownerResolution = await resolveZohoOwnerForZoomAgent(env, agentUserId);
+        } catch (err) {
+          ownerResolution = {
+            zoom_user_id: agentUserId,
+            zoho_user_id: null,
+            zoho_desk_user_id: null,
+            error: String(err?.message || err),
+            error_status: err?.status ?? null,
+            error_details: err?.details ?? null,
+          };
+          console.log("Owner resolution failed:", JSON.stringify(ownerResolution));
         }
+      }
 
+      if (phoneLookupResult && !phoneLookupResult.found) {
         zohoCreatePayload = buildZohoContactCreatePayload({
           phone: callerPhone,
           engagementId,
@@ -313,6 +317,7 @@ async function processEngagementWebhook(env, data) {
               phoneLookup: phoneLookupResult,
               deskContact: deskContactFound,
               departmentId,
+              assigneeId: ownerResolution?.zoho_desk_user_id || null,
             });
           } catch (err) {
             deskTicketError = String(err?.message || err);
@@ -410,7 +415,10 @@ async function resolveZohoOwnerForZoomAgent(env, zoomUserId) {
   const cacheKey = `zoom_to_zoho_user:${zoomUserId}`;
   if (env.coastalsource_kv) {
     const cached = await env.coastalsource_kv.get(cacheKey, { type: "json" });
-    if (cached?.zoho_user_id) {
+    // Honor the cache only if it has both keys (CRM and Desk lookups attempted).
+    // Older cache entries that predate Desk-agent resolution are missing
+    // zoho_desk_user_id entirely; force a refresh in that case.
+    if (cached && "zoho_user_id" in cached && "zoho_desk_user_id" in cached) {
       return { ...cached, source: "cache" };
     }
   }
@@ -432,21 +440,45 @@ async function resolveZohoOwnerForZoomAgent(env, zoomUserId) {
   }
   const email = zoomUser?.email || null;
   if (!email) {
-    return { zoom_user_id: zoomUserId, email: null, zoho_user_id: null, error: "Zoom user has no email" };
+    return {
+      zoom_user_id: zoomUserId,
+      email: null,
+      zoho_user_id: null,
+      zoho_desk_user_id: null,
+      error: "Zoom user has no email",
+    };
   }
 
-  const zohoUserId = await findZohoUserByEmail(env, email);
+  // Resolve CRM user and Desk agent in parallel — separate user pools per product.
+  const zohoToken = await getZohoAccessToken(env);
+  const [zohoUserId, zohoDeskUserId] = await Promise.all([
+    findZohoUserByEmail(env, email).catch((e) => {
+      console.log("CRM user lookup failed:", String(e?.message || e));
+      return null;
+    }),
+    findZohoDeskAgentByEmail(env, zohoToken, email).catch((e) => {
+      console.log("Desk agent lookup failed:", String(e?.message || e));
+      return null;
+    }),
+  ]);
+
   const result = {
     zoom_user_id: zoomUserId,
     email,
     zoho_user_id: zohoUserId,
+    zoho_desk_user_id: zohoDeskUserId,
     source: "fresh",
   };
 
-  if (zohoUserId && env.coastalsource_kv) {
+  if ((zohoUserId || zohoDeskUserId) && env.coastalsource_kv) {
     await env.coastalsource_kv.put(
       cacheKey,
-      JSON.stringify({ zoom_user_id: zoomUserId, email, zoho_user_id: zohoUserId }),
+      JSON.stringify({
+        zoom_user_id: zoomUserId,
+        email,
+        zoho_user_id: zohoUserId,
+        zoho_desk_user_id: zohoDeskUserId,
+      }),
       { expirationTtl: 60 * 60 * 24 * 30 }
     );
   }
@@ -1216,6 +1248,29 @@ async function callZohoDesk(env, accessToken, path, options = {}) {
   return json ?? { raw: text };
 }
 
+async function findZohoDeskAgentByEmail(env, accessToken, email) {
+  const target = String(email || "").toLowerCase();
+  if (!target) return null;
+  // Desk pagination uses from/limit (not page/per_page like CRM).
+  const limit = 100;
+  for (let from = 0; from < 1000; from += limit) {
+    let data;
+    try {
+      data = await callZohoDesk(env, accessToken, `/agents?from=${from}&limit=${limit}`);
+    } catch (err) {
+      console.log(`Desk agent listing (from=${from}) failed:`, String(err?.message || err));
+      return null;
+    }
+    const agents = Array.isArray(data?.data) ? data.data : [];
+    const match = agents.find(
+      (a) => (a?.emailId || a?.email || "").toLowerCase() === target
+    );
+    if (match?.id) return match.id;
+    if (agents.length < limit) return null; // last page
+  }
+  return null;
+}
+
 async function findZohoDeskContactByPhone(env, accessToken, phone) {
   const digits = String(phone || "").replace(/\D/g, "");
   if (!digits) return null;
@@ -1283,6 +1338,7 @@ function buildDeskTicketPayload({
   phoneLookup,
   deskContact,
   departmentId,
+  assigneeId,
 }) {
   const contactName = phoneLookup?.contact?.name || "Unknown Caller";
   const agent = engagementDetails?.agents?.[0];
@@ -1340,6 +1396,10 @@ function buildDeskTicketPayload({
     priority: "Medium",
     status: "Open",
   };
+
+  if (assigneeId) {
+    ticket.assigneeId = String(assigneeId);
+  }
 
   if (deskContact?.id) {
     ticket.contactId = String(deskContact.id);
