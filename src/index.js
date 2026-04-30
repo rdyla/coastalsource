@@ -307,7 +307,15 @@ async function processEngagementWebhook(env, data) {
         deskTicketError = "no disposition set — ticket creation skipped";
       } else {
         const departmentId = pickDeskDepartmentId(env, engagementDetails);
-        if (departmentId) {
+        const primaryDispName =
+          engagementDetails?.dispositions?.[0]?.disposition_name || null;
+        const mappedInquiryType = mapDispositionToInquiryType(primaryDispName);
+
+        if (!departmentId) {
+          deskTicketError = "no department mapping for queue/flow";
+        } else if (!mappedInquiryType) {
+          deskTicketError = `no inquiry type mapping for disposition: ${primaryDispName}`;
+        } else {
           try {
             const zohoToken = await getZohoAccessToken(env);
             deskContactFound = await findZohoDeskContactByPhone(env, zohoToken, callerPhone);
@@ -323,8 +331,6 @@ async function processEngagementWebhook(env, data) {
             deskTicketError = String(err?.message || err);
             console.log("Desk ticket payload build failed:", deskTicketError);
           }
-        } else {
-          deskTicketError = "no department mapping for queue/flow";
         }
       }
     }
@@ -1332,6 +1338,29 @@ function pickDeskDepartmentId(env, engagementDetails) {
   return env.ZOHO_DESK_DEFAULT_DEPARTMENT_ID || null;
 }
 
+// Zoom disposition_name → cf_inquiry_type_2 picklist value. Picklist values
+// must match Desk exactly (Desk validates) — including the en-dash characters.
+// Customer Service queue dispositions only for now; Tech Support to follow.
+const DESK_INQUIRY_TYPE_MAP = {
+  "Dealer Relations": "Dealer Relations",
+  "Escalations": "Escalations – Customer Service and Warehouse",
+  "Order Management": "Order and Shipping – Warehouse and Shipping",
+  "Product/Account Support": "Product/Service Support – Customer Service",
+  "Returns/Exchanges": "Returns/Exchanges – Warehouse and Shipping",
+  "Set-up or diagnostics": "Setup or diagnostics - Tech Support",
+};
+
+function mapDispositionToInquiryType(dispositionName) {
+  if (!dispositionName) return null;
+  if (DESK_INQUIRY_TYPE_MAP[dispositionName]) return DESK_INQUIRY_TYPE_MAP[dispositionName];
+  // Case-insensitive fallback in case Zoom ever capitalizes differently
+  const target = String(dispositionName).toLowerCase().trim();
+  for (const key of Object.keys(DESK_INQUIRY_TYPE_MAP)) {
+    if (key.toLowerCase() === target) return DESK_INQUIRY_TYPE_MAP[key];
+  }
+  return null;
+}
+
 function buildDeskTicketPayload({
   phone,
   engagementDetails,
@@ -1401,15 +1430,28 @@ function buildDeskTicketPayload({
     ticket.assigneeId = String(assigneeId);
   }
 
-  // Map disposition to the Inquiry Type custom-field picklist on the Desk
-  // layout. Single-select, so use the first disposition only.
+  // Map disposition_name to the Inquiry Type custom-field picklist value
+  // (single-select, so first disposition only).
   const primaryDispositionName = dispositions[0]?.disposition_name || null;
-  if (primaryDispositionName) {
-    ticket.cf = { cf_inquiry_type_2: primaryDispositionName };
+  const inquiryTypeValue = mapDispositionToInquiryType(primaryDispositionName);
+  if (inquiryTypeValue) {
+    ticket.cf = { cf_inquiry_type_2: inquiryTypeValue };
+  }
+
+  // Email: prefer the CRM contact's email (matches the customer's spec),
+  // fall back to whatever the Desk contact lookup surfaced.
+  const emailFromCrm = phoneLookup?.contact?.email || null;
+  const emailFromDesk = deskContact?.email || null;
+  const ticketEmail = emailFromCrm || emailFromDesk;
+  if (ticketEmail) {
+    ticket.email = ticketEmail;
   }
 
   if (deskContact?.id) {
     ticket.contactId = String(deskContact.id);
+    if (deskContact.accountId) {
+      ticket.accountId = String(deskContact.accountId);
+    }
   } else {
     const { firstName, lastName } = splitName(contactName);
     ticket.contact = {
@@ -1417,6 +1459,7 @@ function buildDeskTicketPayload({
       phone,
     };
     if (firstName) ticket.contact.firstName = firstName;
+    if (ticketEmail) ticket.contact.email = ticketEmail;
   }
 
   return {
