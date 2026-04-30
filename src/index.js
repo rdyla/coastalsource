@@ -248,6 +248,25 @@ async function processEngagementWebhook(env, data) {
       console.log("Zoom engagement fetch failed:", engagementFetchError);
     }
 
+    // Disposition-added fires the moment the agent picks a disposition during
+    // wrap-up; the wrap-up note is often saved a beat later. Wait briefly and
+    // re-fetch — keep whichever response has more notes (Zoom returns them in
+    // chronological order). Single re-fetch covers the typical wrap-up window.
+    if (engagementDetails) {
+      await new Promise((r) => setTimeout(r, 10000));
+      try {
+        const refreshed = await fetchZoomEngagement(env, engagementId);
+        const before = engagementDetails.notes?.length || 0;
+        const after = refreshed?.notes?.length || 0;
+        if (refreshed && after > before) {
+          console.log(`Wrap-up note appeared after re-fetch (${before} -> ${after})`);
+          engagementDetails = refreshed;
+        }
+      } catch (err) {
+        console.log("Engagement re-fetch failed:", String(err?.message || err));
+      }
+    }
+
     // Merge the disposition the webhook just told us about into engagement_details
     // if the fetch hasn't surfaced it yet (eventual-consistency safety net).
     const webhookDisposition = parsedBody?.payload?.object?.disposition_id
@@ -1511,26 +1530,42 @@ function buildDeskTicketPayload({
     .filter(Boolean)
     .join(", ");
 
-  const notes = Array.isArray(engagementDetails?.notes) ? engagementDetails.notes : [];
+  const rawNotes = Array.isArray(engagementDetails?.notes) ? engagementDetails.notes : [];
 
-  // The agent may write a structured note like "Title: X. Note: Y. Ticketstatus: closed".
-  // Parse the first note for those overrides; fall back to disposition-based
-  // subject when no Title was provided.
-  const firstNoteParsed = notes.length > 0 ? parseStructuredNote(notes[0].note) : null;
+  // Sort notes chronologically — the agent may write a structured note
+  // during the call AND a separate one during wrap-up. The wrap-up note
+  // is the authoritative summary, so its Title/Status overrides win.
+  const notes = [...rawNotes].sort((a, b) =>
+    String(a?.last_modified_time || "").localeCompare(String(b?.last_modified_time || ""))
+  );
+
+  let titleOverride = null;
+  let statusOverride = null;
+  for (const n of notes) {
+    const parsed = parseStructuredNote(n?.note);
+    if (parsed?.title) titleOverride = parsed.title;
+    if (parsed?.status) {
+      const normalized = normalizeDeskStatus(parsed.status);
+      if (normalized) statusOverride = normalized;
+    }
+  }
 
   let subject;
-  if (firstNoteParsed?.title) {
-    subject = firstNoteParsed.title;
+  if (titleOverride) {
+    subject = titleOverride;
   } else {
     subject = dispositionNames || "Inbound call";
-    if (notes.length > 0 && notes[0]?.note) {
-      const noteText = String(notes[0].note).trim();
-      const excerpt = noteText.length > 80 ? noteText.slice(0, 77) + "..." : noteText;
+    // Use the latest note's text as the excerpt so the subject reflects
+    // the wrap-up summary when no explicit Title was given.
+    const fallbackNote = notes[notes.length - 1]?.note;
+    if (fallbackNote) {
+      const text = String(fallbackNote).trim();
+      const excerpt = text.length > 80 ? text.slice(0, 77) + "..." : text;
       subject = `${subject} — ${excerpt}`;
     }
   }
 
-  const overrideStatus = normalizeDeskStatus(firstNoteParsed?.status);
+  const overrideStatus = statusOverride;
 
   // Description: Zoho Desk renders this field as HTML, so use <br> for line breaks
   // and escape user-supplied values to prevent any HTML injection.
