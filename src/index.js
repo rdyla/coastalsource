@@ -1395,6 +1395,7 @@ const DESK_INQUIRY_TYPE_MAP = {
   "Dealer Relations": "Dealer Relations",
   "Escalations": "Escalations – Customer Service and Warehouse",
   "Order Management": "Order and Shipping – Warehouse and Shipping",
+  "Order Management & Shipping": "Order and Shipping – Warehouse and Shipping",
   "Product/Account Support": "Product/Service Support – Customer Service",
   "Returns/Exchanges": "Returns/Exchanges – Warehouse and Shipping",
   "Set-up or diagnostics": "Setup or diagnostics - Tech Support",
