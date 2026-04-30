@@ -1401,6 +1401,13 @@ function buildDeskTicketPayload({
     ticket.assigneeId = String(assigneeId);
   }
 
+  // Map disposition to the Inquiry Type custom-field picklist on the Desk
+  // layout. Single-select, so use the first disposition only.
+  const primaryDispositionName = dispositions[0]?.disposition_name || null;
+  if (primaryDispositionName) {
+    ticket.cf = { cf_inquiry_type_2: primaryDispositionName };
+  }
+
   if (deskContact?.id) {
     ticket.contactId = String(deskContact.id);
   } else {
