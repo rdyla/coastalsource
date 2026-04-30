@@ -1411,6 +1411,61 @@ function mapDispositionToInquiryType(dispositionName) {
   return null;
 }
 
+// Parse structured agent notes of the form
+//   "Title: ... Note: ... Ticketstatus: closed"
+// Returns { title?, note?, status? } with whatever fields were present, or
+// null when no recognizable labels are found. Tolerates case variations,
+// alternate label names ("Notes:", "Status:", "Ticket Status:"), and trims
+// the trailing period agents tend to type between fields.
+function parseStructuredNote(noteText) {
+  if (!noteText) return null;
+  const text = String(noteText);
+  const lowerText = text.toLowerCase();
+
+  const labelDefs = [
+    { key: "title", prefixes: ["title:", "subject:"] },
+    { key: "note", prefixes: ["notes:", "note:"] },
+    { key: "status", prefixes: ["ticketstatus:", "ticket status:", "status:"] },
+  ];
+
+  const positions = [];
+  for (const def of labelDefs) {
+    for (const prefix of def.prefixes) {
+      const idx = lowerText.indexOf(prefix);
+      if (idx >= 0) {
+        positions.push({ key: def.key, start: idx, contentStart: idx + prefix.length });
+        break; // only count one prefix per key
+      }
+    }
+  }
+  if (positions.length === 0) return null;
+
+  positions.sort((a, b) => a.start - b.start);
+  const result = {};
+  for (let i = 0; i < positions.length; i++) {
+    const pos = positions[i];
+    const next = positions[i + 1];
+    const end = next ? next.start : text.length;
+    let content = text.slice(pos.contentStart, end).trim();
+    if (content.endsWith(".")) content = content.slice(0, -1).trim();
+    if (content) result[pos.key] = content;
+  }
+  return Object.keys(result).length > 0 ? result : null;
+}
+
+// Picklist on the Desk side is "Open", "Escalated", "Closed". Match
+// case-insensitively and return the canonical value, or null if the agent
+// typed something we don't recognize (we default to Open in that case).
+function normalizeDeskStatus(rawStatus) {
+  if (!rawStatus) return null;
+  const valid = ["Open", "Escalated", "Closed"];
+  const target = String(rawStatus).toLowerCase().trim();
+  for (const v of valid) {
+    if (v.toLowerCase() === target) return v;
+  }
+  return null;
+}
+
 // Pick the right Desk custom-field + value for the call's inquiry type based
 // on which Zoom queue handled it. Customer Service uses cf_inquiry_type_2
 // with a translation table; Tech Support uses cf_inquiry_type_tech_support
@@ -1457,13 +1512,24 @@ function buildDeskTicketPayload({
 
   const notes = Array.isArray(engagementDetails?.notes) ? engagementDetails.notes : [];
 
-  // Subject: "<disposition> — <first note excerpt>" (note truncated at 80 chars)
-  let subject = dispositionNames || "Inbound call";
-  if (notes.length > 0 && notes[0]?.note) {
-    const noteText = String(notes[0].note).trim();
-    const excerpt = noteText.length > 80 ? noteText.slice(0, 77) + "..." : noteText;
-    subject = `${subject} — ${excerpt}`;
+  // The agent may write a structured note like "Title: X. Note: Y. Ticketstatus: closed".
+  // Parse the first note for those overrides; fall back to disposition-based
+  // subject when no Title was provided.
+  const firstNoteParsed = notes.length > 0 ? parseStructuredNote(notes[0].note) : null;
+
+  let subject;
+  if (firstNoteParsed?.title) {
+    subject = firstNoteParsed.title;
+  } else {
+    subject = dispositionNames || "Inbound call";
+    if (notes.length > 0 && notes[0]?.note) {
+      const noteText = String(notes[0].note).trim();
+      const excerpt = noteText.length > 80 ? noteText.slice(0, 77) + "..." : noteText;
+      subject = `${subject} — ${excerpt}`;
+    }
   }
+
+  const overrideStatus = normalizeDeskStatus(firstNoteParsed?.status);
 
   // Description: Zoho Desk renders this field as HTML, so use <br> for line breaks
   // and escape user-supplied values to prevent any HTML injection.
@@ -1481,12 +1547,23 @@ function buildDeskTicketPayload({
 
   if (notes.length > 0) {
     const userMap = buildUserDisplayNameMap(engagementDetails);
-    lines.push("");
-    lines.push("<b>Agent notes:</b>");
+    const noteLines = [];
     for (const n of notes) {
       const author = userMap[n.user_id] || n.user_id || "Unknown";
       const ts = n.last_modified_time ? `, ${n.last_modified_time}` : "";
-      lines.push(`- ${escapeHtml(n.note)} (${escapeHtml(author)}${escapeHtml(ts)})`);
+      // For structured notes, show only the parsed Note value (not the
+      // Title/Status labels). Skip lines that have nothing to show after
+      // parsing — Title and Status went to ticket fields instead.
+      const parsed = parseStructuredNote(n.note);
+      const displayText = parsed ? parsed.note : n.note;
+      if (displayText) {
+        noteLines.push(`- ${escapeHtml(displayText)} (${escapeHtml(author)}${escapeHtml(ts)})`);
+      }
+    }
+    if (noteLines.length > 0) {
+      lines.push("");
+      lines.push("<b>Agent notes:</b>");
+      lines.push(...noteLines);
     }
   }
 
@@ -1497,7 +1574,7 @@ function buildDeskTicketPayload({
     channel: "Phone",
     phone,
     priority: "Medium",
-    status: "Open",
+    status: overrideStatus || "Open",
   };
 
   if (assigneeId) {
