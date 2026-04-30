@@ -309,11 +309,11 @@ async function processEngagementWebhook(env, data) {
         const departmentId = pickDeskDepartmentId(env, engagementDetails);
         const primaryDispName =
           engagementDetails?.dispositions?.[0]?.disposition_name || null;
-        const mappedInquiryType = mapDispositionToInquiryType(primaryDispName);
+        const inquiryField = buildInquiryTypeCustomField(engagementDetails);
 
         if (!departmentId) {
           deskTicketError = "no department mapping for queue/flow";
-        } else if (!mappedInquiryType) {
+        } else if (!inquiryField) {
           deskTicketError = `no inquiry type mapping for disposition: ${primaryDispName}`;
         } else {
           try {
@@ -1361,6 +1361,30 @@ function mapDispositionToInquiryType(dispositionName) {
   return null;
 }
 
+// Pick the right Desk custom-field + value for the call's inquiry type based
+// on which Zoom queue handled it. Customer Service uses cf_inquiry_type_2
+// with a translation table; Tech Support uses cf_inquiry_type_tech_support
+// with the disposition_name as the picklist value verbatim.
+function buildInquiryTypeCustomField(engagementDetails) {
+  const dispositionName =
+    engagementDetails?.dispositions?.[0]?.disposition_name || null;
+  if (!dispositionName) return null;
+
+  const queueName = engagementDetails?.queues?.[0]?.queue_name || "";
+  const flowName = engagementDetails?.flows?.[0]?.flow_name || "";
+  const haystack = `${queueName} ${flowName}`.toLowerCase();
+
+  if (haystack.includes("technical")) {
+    return { fieldName: "cf_inquiry_type_tech_support", value: dispositionName };
+  }
+  if (haystack.includes("customer")) {
+    const mapped = mapDispositionToInquiryType(dispositionName);
+    if (!mapped) return null;
+    return { fieldName: "cf_inquiry_type_2", value: mapped };
+  }
+  return null;
+}
+
 function buildDeskTicketPayload({
   phone,
   engagementDetails,
@@ -1430,12 +1454,12 @@ function buildDeskTicketPayload({
     ticket.assigneeId = String(assigneeId);
   }
 
-  // Map disposition_name to the Inquiry Type custom-field picklist value
-  // (single-select, so first disposition only).
-  const primaryDispositionName = dispositions[0]?.disposition_name || null;
-  const inquiryTypeValue = mapDispositionToInquiryType(primaryDispositionName);
-  if (inquiryTypeValue) {
-    ticket.cf = { cf_inquiry_type_2: inquiryTypeValue };
+  // Map the disposition to the right Inquiry Type custom field for the
+  // queue (Customer Service uses cf_inquiry_type_2 with a translation
+  // table; Tech Support uses cf_inquiry_type_tech_support verbatim).
+  const inquiryField = buildInquiryTypeCustomField(engagementDetails);
+  if (inquiryField) {
+    ticket.cf = { [inquiryField.fieldName]: inquiryField.value };
   }
 
   // Email: prefer the CRM contact's email (matches the customer's spec),
