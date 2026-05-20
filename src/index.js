@@ -1446,14 +1446,15 @@ function buildUserDisplayNameMap(engagementDetails) {
 }
 
 function pickDeskDepartmentId(env, engagementDetails) {
-  const queueName = engagementDetails?.queues?.[0]?.queue_name || "";
-  const flowName = engagementDetails?.flows?.[0]?.flow_name || "";
-  const haystack = `${queueName} ${flowName}`.toLowerCase();
+  // Use queue_name only — it follows transfers, flow_name doesn't. A call
+  // that enters via "Technical Support_Voice" flow but ends up in the
+  // Customer Service queue belongs to CS.
+  const queueName = (engagementDetails?.queues?.[0]?.queue_name || "").toLowerCase();
 
-  if (haystack.includes("technical") && env.ZOHO_DESK_DEPARTMENT_TECHNICAL_SUPPORT) {
+  if (queueName.includes("technical") && env.ZOHO_DESK_DEPARTMENT_TECHNICAL_SUPPORT) {
     return env.ZOHO_DESK_DEPARTMENT_TECHNICAL_SUPPORT;
   }
-  if (haystack.includes("customer") && env.ZOHO_DESK_DEPARTMENT_CUSTOMER_SERVICE) {
+  if (queueName.includes("customer") && env.ZOHO_DESK_DEPARTMENT_CUSTOMER_SERVICE) {
     return env.ZOHO_DESK_DEPARTMENT_CUSTOMER_SERVICE;
   }
   return env.ZOHO_DESK_DEFAULT_DEPARTMENT_ID || null;
@@ -1559,14 +1560,13 @@ function buildInquiryTypeCustomField(engagementDetails) {
     engagementDetails?.dispositions?.[0]?.disposition_name || null;
   if (!dispositionName) return null;
 
-  const queueName = engagementDetails?.queues?.[0]?.queue_name || "";
-  const flowName = engagementDetails?.flows?.[0]?.flow_name || "";
-  const haystack = `${queueName} ${flowName}`.toLowerCase();
+  // Match on queue_name only — see pickDeskDepartmentId for rationale.
+  const queueName = (engagementDetails?.queues?.[0]?.queue_name || "").toLowerCase();
 
-  if (haystack.includes("technical")) {
+  if (queueName.includes("technical")) {
     return { fieldName: "cf_inquiry_type_tech_support", value: dispositionName };
   }
-  if (haystack.includes("customer")) {
+  if (queueName.includes("customer")) {
     const mapped = mapDispositionToInquiryType(dispositionName);
     if (!mapped) return null;
     return { fieldName: "cf_inquiry_type_2", value: mapped };
