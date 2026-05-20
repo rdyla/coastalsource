@@ -267,19 +267,13 @@ async function processEngagementWebhook(env, data) {
       }
     }
 
-    // Merge the disposition the webhook just told us about into engagement_details
-    // if the fetch hasn't surfaced it yet (eventual-consistency safety net).
-    const webhookDisposition = parsedBody?.payload?.object?.disposition_id
-      ? {
-          disposition_id: parsedBody.payload.object.disposition_id,
-          disposition_name: parsedBody.payload.object.disposition_name,
-        }
-      : null;
-    if (engagementDetails && webhookDisposition) {
-      if (!Array.isArray(engagementDetails.dispositions) || engagementDetails.dispositions.length === 0) {
-        engagementDetails.dispositions = [webhookDisposition];
-      }
-    }
+    // Resolve the "current" context for THIS event based on the webhook
+    // payload. For transferred calls engagementDetails.queues[0] is the
+    // initial queue, not the queue where the disposition was actually set —
+    // so we move the webhook's queue/agent/flow/disposition to [0] in each
+    // array. All downstream code that reads [0] then sees the final-state
+    // values and routes accordingly.
+    engagementDetails = resolveEngagementContext(engagementDetails, parsedBody?.payload?.object);
 
     const callerPhone = engagementDetails?.consumers?.[0]?.consumer_number || null;
     if (callerPhone) {
@@ -427,6 +421,62 @@ async function processEngagementWebhook(env, data) {
       expirationTtl: 60 * 60 * 24 * 7,
     });
   }
+}
+
+// Reorders engagementDetails arrays so the webhook payload's queue, flow,
+// agent, and disposition end up at index [0]. The transfer scenario is the
+// reason this exists: engagement.queues[0] is whichever queue the call
+// originally came in on, but the disposition_added webhook tells us which
+// queue the FINAL agent set the disposition from. Existing downstream code
+// reads [0] for routing decisions, so this lets us fix transfer routing
+// without rewriting every call site.
+function resolveEngagementContext(engagementDetails, webhookPayloadObject) {
+  if (!webhookPayloadObject) return engagementDetails;
+  const base = engagementDetails ? { ...engagementDetails } : {};
+  const wp = webhookPayloadObject;
+
+  const moveToFront = (arr, predicate, fallback) => {
+    const list = Array.isArray(arr) ? arr : [];
+    const existing = list.find(predicate);
+    const head = existing || fallback;
+    if (!head) return list;
+    const others = list.filter((item) => !predicate(item));
+    return [head, ...others];
+  };
+
+  if (wp.queue_name) {
+    base.queues = moveToFront(
+      base.queues,
+      (q) => q?.queue_name === wp.queue_name,
+      {
+        queue_id: wp.queue_id || null,
+        queue_name: wp.queue_name,
+        cc_queue_id: wp.cc_queue_id || null,
+      }
+    );
+  }
+  if (wp.flow_name) {
+    base.flows = moveToFront(
+      base.flows,
+      (f) => f?.flow_name === wp.flow_name,
+      { flow_id: wp.flow_id || null, flow_name: wp.flow_name }
+    );
+  }
+  if (wp.user_id) {
+    base.agents = moveToFront(
+      base.agents,
+      (a) => a?.user_id === wp.user_id,
+      { user_id: wp.user_id, display_name: wp.user_display_name || wp.user_id }
+    );
+  }
+  if (wp.disposition_id && wp.disposition_name) {
+    base.dispositions = moveToFront(
+      base.dispositions,
+      (d) => d?.disposition_id === wp.disposition_id,
+      { disposition_id: wp.disposition_id, disposition_name: wp.disposition_name }
+    );
+  }
+  return base;
 }
 
 function extractPrimaryAgentId(engagementDetails) {
