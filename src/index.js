@@ -39,9 +39,40 @@ async function handleZohoRoutes(request, env, ctx, url) {
   };
 
   const handler = routes[`${request.method} ${url.pathname}`];
-  if (!handler) return json({ error: "Not Found" }, 404);
+  if (handler) return handler(request, env, ctx, url);
 
-  return handler(request, env, ctx, url);
+  const contactMatch = url.pathname.match(/^\/zoho\/contact\/([^/]+)$/);
+  if (contactMatch && request.method === "GET") {
+    return handleContactById(env, decodeURIComponent(contactMatch[1]));
+  }
+
+  return json({ error: "Not Found" }, 404);
+}
+
+// Debug aid for the Full_Name change in handleLookupByPhone — returns the old
+// and new name derivations side by side for one contact so they can be
+// compared against what Zoho actually holds. Safe to delete once the fix has
+// been confirmed in production.
+async function handleContactById(env, id) {
+  const token = await getZohoAccessToken(env);
+  const zohoUrl = `https://www.zohoapis.com/crm/v2/Contacts/${encodeURIComponent(id)}`;
+  const data = await callZoho(env, token, zohoUrl);
+  const rec = Array.isArray(data?.data) ? data.data[0] : data?.data;
+  if (!rec) return json({ found: false, id });
+
+  const composed = [rec.First_Name, rec.Last_Name].filter(Boolean).join(" ");
+  return json({
+    found: true,
+    id: rec.id,
+    Full_Name: rec.Full_Name ?? null,
+    First_Name: rec.First_Name ?? null,
+    Last_Name: rec.Last_Name ?? null,
+    Salutation: rec.Salutation ?? null,
+    Phone: rec.Phone ?? null,
+    Mobile: rec.Mobile ?? null,
+    name_old_logic: composed || null, // what the worker returned BEFORE the fix
+    name_new_logic: rec.Full_Name || composed || null, // AFTER the fix
+  });
 }
 
 /* -----------------------------
@@ -66,6 +97,20 @@ async function handleZoomRoutes(request, env, ctx, url) {
 
   if (url.pathname === "/zoom/webhooks/recent" && request.method === "GET") {
     return handleWebhooksRecent(request, env);
+  }
+
+  // Manual alert-channel smoke test. Bypasses the cooldown so it always sends.
+  if (url.pathname === "/zoom/alert-test" && request.method === "GET") {
+    const result = await maybeSendAlert(env, {
+      type: "test",
+      summary: "Test alert — ignore",
+      details: {
+        note: "Manual test from /zoom/alert-test",
+        at: new Date().toISOString(),
+      },
+      force: true,
+    });
+    return json({ ok: true, ...result });
   }
 
   const idMatch = url.pathname.match(/^\/zoom\/webhooks\/([^/]+)$/);
@@ -420,6 +465,136 @@ async function processEngagementWebhook(env, data) {
     await env.coastalsource_kv.put(`webhook:${id}`, JSON.stringify(record), {
       expirationTtl: 60 * 60 * 24 * 7,
     });
+  }
+
+  if (isDispositionEvent && !duplicateOf) {
+    const wp = parsedBody?.payload?.object || {};
+    const common = {
+      engagement_id: engagementId,
+      received_at: receivedAt,
+      queue: wp.queue_name || engagementDetails?.queues?.[0]?.queue_name || "-",
+      disposition:
+        wp.disposition_name ||
+        engagementDetails?.dispositions?.[0]?.disposition_name ||
+        "-",
+      webhook_record: `${path} (id ${id})`,
+    };
+
+    if (engagementFetchError) {
+      await maybeSendAlert(env, {
+        type: "zoom_fetch",
+        summary: "Zoom engagement fetch is failing — tickets are NOT being created",
+        details: { ...common, error: engagementFetchError },
+      });
+    } else if (
+      deskTicketPayload &&
+      env.DESK_AUTO_CREATE_TICKETS === "true" &&
+      !deskTicketDispatched &&
+      deskTicketError &&
+      !deskTicketError.startsWith("dispatch skipped")
+    ) {
+      await maybeSendAlert(env, {
+        type: "desk_dispatch",
+        summary: "Zoho Desk ticket dispatch failed",
+        details: { ...common, error: deskTicketError },
+      });
+    }
+  }
+}
+
+// Fan an alert out to whichever channels are configured, with a per-type
+// cooldown in KV so a sustained outage doesn't mail out on every call.
+// `force: true` bypasses the cooldown (used by /zoom/alert-test).
+async function maybeSendAlert(env, { type, summary, details, force = false }) {
+  const cooldownSec = Number(env.ALERT_COOLDOWN_SECONDS) || 3600;
+  const cooldownKey = `alert_cooldown:${type}`;
+
+  if (!force && env.coastalsource_kv) {
+    const recent = await env.coastalsource_kv.get(cooldownKey);
+    if (recent) {
+      console.log(`Alert '${type}' suppressed (cooldown active since ${recent})`);
+      return { sent: false, suppressed: true };
+    }
+  }
+
+  const channels = [];
+  if (env.ALERT_ZOOM_WEBHOOK_URL) {
+    channels.push({ name: "zoom_chat", run: sendZoomChatAlert(env, summary, details) });
+  }
+  if (env.ALERT_RESEND_API_KEY && env.ALERT_EMAIL_TO) {
+    channels.push({ name: "resend_email", run: sendResendEmailAlert(env, summary, details) });
+  }
+  if (channels.length === 0) {
+    console.log(`Alert '${type}' not sent — no alert channel configured`);
+    return { sent: false, unconfigured: true };
+  }
+
+  const settled = await Promise.allSettled(channels.map((c) => c.run));
+  const results = settled.map((r, i) => ({
+    channel: channels[i].name,
+    ok: r.status === "fulfilled",
+    error: r.status === "rejected" ? String(r.reason?.message || r.reason) : null,
+  }));
+  const sent = results.some((r) => r.ok);
+  for (const r of results) {
+    if (!r.ok) console.log(`Alert '${type}' channel '${r.channel}' failed:`, r.error);
+  }
+
+  // Only start the cooldown once something actually went out, so a broken
+  // channel doesn't silently suppress the next hour of alerts.
+  if (sent && !force && env.coastalsource_kv) {
+    await env.coastalsource_kv.put(cooldownKey, new Date().toISOString(), {
+      expirationTtl: cooldownSec,
+    });
+  }
+
+  return { sent, results };
+}
+
+async function sendZoomChatAlert(env, summary, details) {
+  const detailLines = Object.entries(details)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join("\n");
+  const text = `⚠️ Coastal Source Worker — ${summary}\n\n${detailLines}`;
+
+  const u = new URL(env.ALERT_ZOOM_WEBHOOK_URL);
+  u.searchParams.set("format", "message");
+  const headers = { "Content-Type": "text/plain" };
+  if (env.ALERT_ZOOM_WEBHOOK_SECRET) {
+    headers.Authorization = env.ALERT_ZOOM_WEBHOOK_SECRET;
+  }
+
+  const res = await fetch(u.toString(), { method: "POST", headers, body: text });
+  if (!res.ok) throw new Error(`Zoom chat alert failed: ${res.status} ${await res.text()}`);
+}
+
+async function sendResendEmailAlert(env, summary, details) {
+  const from =
+    env.ALERT_EMAIL_FROM || "Coastal Source Worker <noreply@notifications.packetfusion.com>";
+  const to = env.ALERT_EMAIL_TO.split(",").map((a) => a.trim()).filter(Boolean);
+  const textBody = Object.entries(details)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join("\n");
+  const htmlBody = Object.entries(details)
+    .map(([k, v]) => `<b>${escapeHtml(k)}:</b> ${escapeHtml(String(v))}`)
+    .join("<br>");
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.ALERT_RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from,
+      to,
+      subject: `⚠️ Coastal Source Worker: ${summary}`,
+      text: `${summary}\n\n${textBody}`,
+      html: `<p><b>${escapeHtml(summary)}</b></p>${htmlBody}`,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Resend send failed: ${res.status} ${await res.text()}`);
   }
 }
 
@@ -933,7 +1108,12 @@ async function lookupZohoByPhone(env, phoneRaw) {
         phone_normalized: p,
         contact: {
           id: contact.id,
-          name: [contact.First_Name, contact.Last_Name].filter(Boolean).join(" "),
+          // Prefer Zoho's own Full_Name — it accounts for salutation and
+          // middle names that First+Last drops.
+          name:
+            contact.Full_Name ||
+            [contact.First_Name, contact.Last_Name].filter(Boolean).join(" ") ||
+            null,
           email: contact.Email ?? null,
           phone: contact.Phone ?? null,
           mobile: contact.Mobile ?? null,
@@ -1756,15 +1936,37 @@ async function handlePopupAccountsSearch(env, url) {
 
   try {
     const accessToken = await getZohoAccessToken(env);
-    const criteria = `(Account_Name:starts_with:${q})`;
-    const zohoUrl =
-      `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=` +
-      encodeURIComponent(criteria) +
-      `&per_page=15`;
-    const data = await callZoho(env, accessToken, zohoUrl);
-    const accounts = Array.isArray(data?.data)
-      ? data.data.map((a) => ({ id: a.id, name: a.Account_Name }))
-      : [];
+    // Zoho's criteria syntax treats parens and commas as structure, so a query
+    // containing them (e.g. "(NJ) AMT Video") can't go through starts_with.
+    // Fall back to a broad word search and narrow it client-side.
+    const special = /[(),]/.test(q);
+    let accounts;
+
+    if (special) {
+      const word = q.replace(/[(),]/g, " ").trim();
+      const zohoUrl =
+        `https://www.zohoapis.com/crm/v2/Accounts/search?word=` +
+        encodeURIComponent(word) +
+        `&per_page=200`;
+      const data = await callZoho(env, accessToken, zohoUrl);
+      const needle = q.toLowerCase();
+      accounts = (Array.isArray(data?.data) ? data.data : [])
+        .filter((a) => String(a.Account_Name || "").toLowerCase().includes(needle))
+        .slice(0, 15)
+        .map((a) => ({ id: a.id, name: a.Account_Name }));
+    } else {
+      const criteria = `(Account_Name:starts_with:${q})`;
+      const zohoUrl =
+        `https://www.zohoapis.com/crm/v2/Accounts/search?criteria=` +
+        encodeURIComponent(criteria) +
+        `&per_page=15`;
+      const data = await callZoho(env, accessToken, zohoUrl);
+      accounts = (Array.isArray(data?.data) ? data.data : []).map((a) => ({
+        id: a.id,
+        name: a.Account_Name,
+      }));
+    }
+
     return json({ accounts });
   } catch (err) {
     // No-match search throws in callZoho on non-OK Zoho responses. Return empty set.
