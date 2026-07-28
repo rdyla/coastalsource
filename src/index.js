@@ -1305,6 +1305,19 @@ async function handleAccountSummary(request, env, ctx, url) {
 function requireApiKey(request, env) {
   const apiKey = request.headers.get("x-api-key");
   if (!apiKey || apiKey !== env.ZOOM_API_KEY) {
+    // Log enough to tell the three causes apart in `wrangler tail` — header
+    // absent (not configured, misspelled, or sent as a query param), header
+    // present but stale, or a path/method that fell through to this gate
+    // instead of matching its intended route. Never log the key itself.
+    console.log(
+      "API key rejected:",
+      JSON.stringify({
+        method: request.method,
+        path: new URL(request.url).pathname,
+        header: apiKey ? "present-but-wrong" : "absent",
+        configured: env.ZOOM_API_KEY ? "yes" : "NO",
+      })
+    );
     return json({ error: "Unauthorized" }, 401);
   }
   return null;
@@ -1625,16 +1638,30 @@ function buildUserDisplayNameMap(engagementDetails) {
   return map;
 }
 
-function pickDeskDepartmentId(env, engagementDetails) {
-  // Use queue_name only — it follows transfers, flow_name doesn't. A call
-  // that enters via "Technical Support_Voice" flow but ends up in the
-  // Customer Service queue belongs to CS.
+// Zoom queue_name → routing bucket. Both the department pick and the Inquiry
+// Type field branch off this, so a new queue only has to be taught here once.
+// Use queue_name only — it follows transfers, flow_name doesn't. A call that
+// enters via "Technical Support_Voice" flow but ends up in the Customer
+// Service queue belongs to CS.
+function pickDeskQueueBucket(engagementDetails) {
   const queueName = (engagementDetails?.queues?.[0]?.queue_name || "").toLowerCase();
 
-  if (queueName.includes("technical") && env.ZOHO_DESK_DEPARTMENT_TECHNICAL_SUPPORT) {
+  // "Warranty" queue is handled by the Tech Support team and its dispositions
+  // are the Tech Support picklist values, so it routes as technical.
+  if (queueName.includes("technical") || queueName.includes("warranty")) {
+    return "technical";
+  }
+  if (queueName.includes("customer")) return "customer";
+  return null;
+}
+
+function pickDeskDepartmentId(env, engagementDetails) {
+  const bucket = pickDeskQueueBucket(engagementDetails);
+
+  if (bucket === "technical" && env.ZOHO_DESK_DEPARTMENT_TECHNICAL_SUPPORT) {
     return env.ZOHO_DESK_DEPARTMENT_TECHNICAL_SUPPORT;
   }
-  if (queueName.includes("customer") && env.ZOHO_DESK_DEPARTMENT_CUSTOMER_SERVICE) {
+  if (bucket === "customer" && env.ZOHO_DESK_DEPARTMENT_CUSTOMER_SERVICE) {
     return env.ZOHO_DESK_DEPARTMENT_CUSTOMER_SERVICE;
   }
   return env.ZOHO_DESK_DEFAULT_DEPARTMENT_ID || null;
@@ -1740,13 +1767,12 @@ function buildInquiryTypeCustomField(engagementDetails) {
     engagementDetails?.dispositions?.[0]?.disposition_name || null;
   if (!dispositionName) return null;
 
-  // Match on queue_name only — see pickDeskDepartmentId for rationale.
-  const queueName = (engagementDetails?.queues?.[0]?.queue_name || "").toLowerCase();
+  const bucket = pickDeskQueueBucket(engagementDetails);
 
-  if (queueName.includes("technical")) {
+  if (bucket === "technical") {
     return { fieldName: "cf_inquiry_type_tech_support", value: dispositionName };
   }
-  if (queueName.includes("customer")) {
+  if (bucket === "customer") {
     const mapped = mapDispositionToInquiryType(dispositionName);
     if (!mapped) return null;
     return { fieldName: "cf_inquiry_type_2", value: mapped };
