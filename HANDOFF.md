@@ -1,13 +1,27 @@
 # Handoff — pick-up notes
 
-Last touched 2026-07-28 via commit `0010864`.
+Last touched 2026-08-05 via commit `0021bd8`.
 
-> **Deploy state:** the repo is now in sync with production as of 2026-07-28. Commit `54ce388`
-> recovered five changes that had been deployed on 2026-07-21 but never committed — if you are
-> picking this up after a gap, verify the running version still matches `main` before editing.
-> `npx wrangler deploy --dry-run --outdir=/tmp/b` and diff `/tmp/b/index.js` against the deployed
-> bundle from `GET /accounts/<acct>/workers/scripts/coastalsource/content/v2` (the OAuth token
-> wrangler already holds works for `/content/v2`; the legacy `/content` returns 405).
+> **Deploy state:** repo verified in sync with production on 2026-08-05 (version
+> `87af1c31`).
+>
+> **Check this before you edit.** Undeployed code has been found twice: `54ce388` recovered
+> five changes deployed 2026-07-21, and `4267f39` recovered a subject-fallback fix deployed
+> 2026-07-28 — the second was caught only because the bundle was re-diffed minutes before an
+> unrelated push that would have reverted it. Deploy from `main`, and verify first:
+>
+> ```
+> npx wrangler deploy --dry-run --outdir=/tmp/b
+> curl -H "Authorization: Bearer $(grep -m1 '^oauth_token' \
+>   ~/Library/Preferences/.wrangler/config/default.toml | sed 's/.*= *"//;s/"$//')" \
+>   "https://api.cloudflare.com/client/v4/accounts/521c322a89a17bb69f91f1e65177606e/workers/scripts/coastalsource/content/v2" \
+>   -o /tmp/live.multipart      # multipart; the index.js part is the deployed bundle
+> ```
+>
+> Both sides are esbuild output, so they diff cleanly — strip the trailing `sourceMappingURL`
+> line first. The OAuth token wrangler already holds works for `/content/v2`; the legacy
+> `/content` returns 405. Recovery only works because the bundle is unminified — don't count
+> on that forever.
 
 ## Where this is
 
@@ -209,25 +223,33 @@ npx wrangler kv bulk get keys.json --namespace-id=5e7000fe8fba49b69a998298f7c6c4
 Note `desk_ticket_error` also carries the intentional-skip messages, so it is not a pure
 error field — filter out `intentionally skipped` before counting failures.
 
+## Closed out
+
+- **Warranty queue dropping every call** — unmapped queue, fixed 2026-07-28. Confirmed in
+  production: three Warranty-queue calls on 08-03 and 08-05 all created tickets in the Tech
+  Support department.
+- **Dropped-call alerting** — added 2026-07-28, see Alerting above.
+- **Alert channels verified** — `GET /zoom/alert-test` on 2026-08-05 returned `sent: true`
+  with both `zoom_chat` and `resend_email` reporting `ok`, and both messages were confirmed
+  received (email + Zoom chat). Re-run that endpoint after rotating `ALERT_RESEND_API_KEY` or
+  changing `ALERT_ZOOM_WEBHOOK_URL` — a dead channel throws, gets logged, and is then
+  swallowed by `Promise.allSettled`, so nothing else will tell you.
+- **Backfill of the 11 Warranty calls** dropped between 2026-07-23 and 2026-07-28 — completed
+  2026-07-28 via a temporary `POST /admin/backfill` endpoint (since removed, never committed).
+  Confirmed complete.
+
 ## Possible follow-ups (none blocking)
 
-1. **Verify the alert channels actually deliver** — `GET /zoom/alert-test` force-sends on
-   every configured channel. Nothing has confirmed `ALERT_ZOOM_WEBHOOK_URL` or the Resend
-   key still work, and a dead channel fails silently (logged, then swallowed by
-   `Promise.allSettled`). The `desk_dropped` alerting added 2026-07-28 is only as good as
-   the channels underneath it.
-2. **Set `ZOHO_DESK_DEFAULT_DEPARTMENT_ID`** — so an unrecognized queue lands somewhere a
-   human will see instead of failing closed.
-3. **Backfill the 11 Warranty-queue calls** dropped between 2026-07-23 and 2026-07-28.
-   Engagement ids are in the KV `webhook:` records; two of them (`vy-lZUUTQZuqg4jbcFc4aQ`,
-   `8IjeRKX_QauSDPG15z5xbA`) are the same Pratt Guys thread, so it's ~10 tickets.
-4. **Trailing-slash footgun on the webhook catcher** — `catcherPaths` accepts
+1. **Set `ZOHO_DESK_DEFAULT_DEPARTMENT_ID`** — so an unrecognized queue lands somewhere a
+   human will see instead of failing closed. The `desk_dropped` alert now catches this case,
+   but the call still produces no ticket.
+2. **Trailing-slash footgun on the webhook catcher** — `catcherPaths` accepts
    `/zoom/webhooks` and `/zoom/webhooks/` but only `/zoom/engagement-webhook` without a
    trailing slash. A POST to `/zoom/engagement-webhook/` falls through to the api-key gate
    and returns 401 with no log line at all. Worth normalizing.
-5. **Durable logs** — a Tail Worker or Logpush would keep the console output that currently
+3. **Durable logs** — a Tail Worker or Logpush would keep the console output that currently
    vanishes unless someone is holding a `wrangler tail` open.
-6. **`cx_engagement_end_data_ready` cleanup** — that older event is no longer the trigger; the route still matches it harmlessly and can be removed if cleaning up
-7. **Lead dedup by phone** — leads currently can duplicate; popup form is fine with that, but could add a check if the customer prefers
-8. **Disposition → Desk classification** — if reporting wants this in a first-class field rather than the cf_inquiry_type custom field, requires Desk classification config + a translation map
-9. **Recording / transcript ingestion** — Zoom CC has scopes for these (`contact_center:read:list_recordings:admin`, etc.); not currently granted
+4. **`cx_engagement_end_data_ready` cleanup** — that older event is no longer the trigger; the route still matches it harmlessly and can be removed if cleaning up
+5. **Lead dedup by phone** — leads currently can duplicate; popup form is fine with that, but could add a check if the customer prefers
+6. **Disposition → Desk classification** — if reporting wants this in a first-class field rather than the cf_inquiry_type custom field, requires Desk classification config + a translation map
+7. **Recording / transcript ingestion** — Zoom CC has scopes for these (`contact_center:read:list_recordings:admin`, etc.); not currently granted
