@@ -63,12 +63,26 @@ succeeds, so a broken channel can't suppress the next hour.
 - Email via Resend, needs `ALERT_RESEND_API_KEY` + `ALERT_EMAIL_TO` (comma-separated)
 - Smoke test: `GET /zoom/alert-test` — bypasses the cooldown, always sends
 
-**Known blind spot.** Alerts fire on `engagement_fetch_error`, and on Desk dispatch failures
-*only when a ticket payload was successfully built*. The four pre-dispatch bail-outs in
-`processEngagementWebhook` — no disposition, intentional skip, no department mapping, no
-inquiry type mapping — leave `deskTicketPayload` null and therefore **cannot alert**. That
-gap is why the Warranty queue dropped 11 tickets across five days unnoticed. Alerting is not
-a safety net for routing-config gaps; check `/zoom/webhooks/recent` for those.
+**What alerts**
+
+| Condition | Alert type |
+|---|---|
+| Zoom engagement fetch failed | `zoom_fetch` |
+| Desk dispatch failed after a payload was built | `desk_dispatch` |
+| Call dropped before a ticket was attempted | `desk_dropped:<reason>:<queue>` |
+
+The third covers the three pre-dispatch bail-outs — `no_disposition`,
+`no_department_mapping`, `no_inquiry_type_mapping` — driven by the `deskDroppedReason` flag
+set at each bail-out site rather than by matching on `desk_ticket_error` wording. All three
+mean the call is simply gone, so they're the ones you actually want paged. Intentional skips
+never set the flag and stay quiet, and all of it is gated on `DESK_AUTO_CREATE_TICKETS`.
+
+The cooldown key includes the reason *and* the queue, so a second unmapped queue still alerts
+instead of being swallowed by the first one's hour.
+
+Until 2026-07-28 the `desk_dropped` case did not exist, and the `desk_dispatch` condition
+required `deskTicketPayload` to be non-null — which no pre-dispatch bail-out ever satisfies.
+That is why the Warranty queue dropped 11 calls across five days with alerting switched on.
 
 ### Agent popup at `/popup?phone=<ANI>&engagement_id=<id>`
 
@@ -197,9 +211,11 @@ error field — filter out `intentionally skipped` before counting failures.
 
 ## Possible follow-ups (none blocking)
 
-1. **Close the alerting blind spot** — have the pre-dispatch bail-outs alert too, at least
-   "no department mapping" and "no inquiry type mapping". Both mean a call was silently
-   dropped, which is exactly what you want paged. See the Alerting section above.
+1. **Verify the alert channels actually deliver** — `GET /zoom/alert-test` force-sends on
+   every configured channel. Nothing has confirmed `ALERT_ZOOM_WEBHOOK_URL` or the Resend
+   key still work, and a dead channel fails silently (logged, then swallowed by
+   `Promise.allSettled`). The `desk_dropped` alerting added 2026-07-28 is only as good as
+   the channels underneath it.
 2. **Set `ZOHO_DESK_DEFAULT_DEPARTMENT_ID`** — so an unrecognized queue lands somewhere a
    human will see instead of failing closed.
 3. **Backfill the 11 Warranty-queue calls** dropped between 2026-07-23 and 2026-07-28.

@@ -274,6 +274,10 @@ async function processEngagementWebhook(env, data) {
   let deskContactFound = null;
   let deskTicketPayload = null;
   let deskTicketError = null;
+  // Set when the call was dropped before a ticket was even attempted, so the
+  // alert block below can tell a config gap apart from an intentional skip.
+  // Deliberately a flag rather than a check on deskTicketError's wording.
+  let deskDroppedReason = null;
   let deskTicketDispatched = false;
   let deskTicketId = null;
 
@@ -364,6 +368,10 @@ async function processEngagementWebhook(env, data) {
 
       if (!hasDisposition) {
         deskTicketError = "no disposition set — ticket creation skipped";
+        // The trigger event is disposition_added and the payload carries the
+        // disposition, so this should be unreachable — if it fires, something
+        // upstream changed.
+        deskDroppedReason = "no_disposition";
       } else {
         const departmentId = pickDeskDepartmentId(env, engagementDetails);
         const primaryDispName =
@@ -374,8 +382,10 @@ async function processEngagementWebhook(env, data) {
           deskTicketError = `disposition '${primaryDispName}' — ticket creation intentionally skipped`;
         } else if (!departmentId) {
           deskTicketError = "no department mapping for queue/flow";
+          deskDroppedReason = "no_department_mapping";
         } else if (!inquiryField) {
           deskTicketError = `no inquiry type mapping for disposition: ${primaryDispName}`;
+          deskDroppedReason = "no_inquiry_type_mapping";
         } else {
           try {
             const zohoToken = await getZohoAccessToken(env);
@@ -497,6 +507,20 @@ async function processEngagementWebhook(env, data) {
         type: "desk_dispatch",
         summary: "Zoho Desk ticket dispatch failed",
         details: { ...common, error: deskTicketError },
+      });
+    } else if (deskDroppedReason && env.DESK_AUTO_CREATE_TICKETS === "true") {
+      // A routing/config gap means no ticket was even attempted — the call is
+      // simply gone. The dispatch branch above can't catch these because they
+      // bail out before deskTicketPayload is ever built.
+      //
+      // Cooldown is keyed per reason *and* queue so that a second unmapped
+      // queue still alerts instead of being swallowed by the first one's
+      // hour. Intentional skips never set deskDroppedReason, so they stay
+      // quiet.
+      await maybeSendAlert(env, {
+        type: `desk_dropped:${deskDroppedReason}:${common.queue}`,
+        summary: `Call dropped, no Desk ticket attempted — ${deskDroppedReason}`,
+        details: { ...common, reason: deskDroppedReason, error: deskTicketError },
       });
     }
   }
