@@ -1829,9 +1829,16 @@ function buildDeskTicketPayload({
     // the wrap-up summary when no explicit Title was given.
     const fallbackNote = notes[notes.length - 1]?.note;
     if (fallbackNote) {
-      const text = String(fallbackNote).trim();
-      const excerpt = text.length > 80 ? text.slice(0, 77) + "..." : text;
-      subject = `${subject} — ${excerpt}`;
+      // If the note is structured, excerpt only its Notes: body — otherwise the
+      // subject ends up carrying the "Title:"/"Ticketstatus:" labels too.
+      // Collapse whitespace so a multi-line note doesn't wreck the subject.
+      const parsedFallback = parseStructuredNote(fallbackNote);
+      const source = parsedFallback?.note || String(fallbackNote);
+      const text = source.replace(/\s+/g, " ").trim();
+      if (text) {
+        const excerpt = text.length > 80 ? text.slice(0, 77) + "..." : text;
+        subject = `${subject} — ${excerpt}`;
+      }
     }
   }
 
