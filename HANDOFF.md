@@ -132,6 +132,30 @@ the other `/zoom/*` routes.
 - Posts via the shared `postZoomChat()` helper. Needs `SUPERVISOR_WEBHOOK_URL`
   (503 without it) and optionally `SUPERVISOR_WEBHOOK_SECRET`. Chat post failure → 502.
 
+### Chat identity capture
+
+`POST` or `GET /zoom/chat-identity` — the Zoom flow posts what it collected about a web-chat
+customer; the disposition webhook reads it back and opens the ticket. Gated by `ZOOM_API_KEY`.
+
+Zoom exposes nothing usable to identify a web-chat customer on its own: no email, no phone,
+`consumer_display_name` is the literal `"Consumer"`, and `consumer_id` is not per-person (two
+separate 2026-08-27 engagements shared `P3PxHzMHTpmf5Dd7JfI-HQ`). The flow's `Variable` step
+is visible in `events` but its name and value are never returned. `/engagements/<id>/notes`
+and `/recordings` are 401 on scope; the other sub-paths 400. Hence push, not pull.
+
+- Engagement id: `e`, `engagement_id`, `engagementId`, `engagement`, `id` (required).
+- Identity: `email`, `phone`, `name`, `first_name`, `last_name` — at least one required,
+  each with aliases (`consumer_email`, `customer_email`, `full_name`, …).
+- Path is lowercased and trailing-slash tolerant; query string or JSON body both work.
+- Stored at `chat_identity:<engagement_id>`, TTL `CHAT_IDENTITY_TTL_SECONDS` (default 24h —
+  short because it is customer PII and the disposition normally lands within minutes).
+- 400 with the accepted field names if the id or all identity fields are missing.
+
+At disposition time, an engagement with no `consumer_number` looks this up. With an email it
+resolves a Desk contact by email (or creates one inline with the email attached) and opens a
+`channel: "Chat"` ticket with no phone field. With neither phone nor email it stays a
+recorded, alerting drop (`desk_dropped:no_caller_identity:<queue>`).
+
 ### Agent popup at `/popup?phone=<ANI>&engagement_id=<id>`
 
 - Contact match by phone → 302 to `/tab/Contacts/<id>`
@@ -208,6 +232,7 @@ Set via `wrangler secret put <NAME>`, never committed:
 - `ALERT_COOLDOWN_SECONDS` — optional, defaults to 3600
 - `SUPERVISOR_WEBHOOK_URL`, `SUPERVISOR_WEBHOOK_SECRET` — supervisor-assist Zoom chat
 - `SUPERVISOR_ASSIST_DEDUPE_SECONDS` — optional, defaults to 900
+- `CHAT_IDENTITY_TTL_SECONDS` — optional, defaults to 86400
 
 Not set, but referenced in code: `ZOHO_DESK_DEFAULT_DEPARTMENT_ID` (see department routing above).
 
@@ -285,30 +310,23 @@ error field — filter out `intentionally skipped` before counting failures.
 
 ## Possible follow-ups (none blocking)
 
-1. **Chat/messaging tickets — blocked on two Zoom-side config changes.** As of 2026-08-28
-   chat engagements are recorded and alerted (`desk_dropped:no_caller_phone:<queue>`) but
-   still produce no Desk ticket. The worker side needs no further change until Zoom is
-   configured:
+1. **Chat tickets — worker side is done, two Zoom-side changes remain.** As of 2026-08-29
+   the worker will open a Desk ticket for a chat engagement as soon as the flow posts an
+   email (or phone) to `/zoom/chat-identity`. Nothing further is needed here. Outstanding:
 
-   a. **Pre-chat identity.** Anonymous web chat supplies nothing usable — no email, no
-      phone, and `consumer_display_name` is the literal string `"Consumer"`. The
-      `consumer_id` is *not* per-person either: two separate 2026-08-27 engagements both
-      carried `P3PxHzMHTpmf5Dd7JfI-HQ`. Zoho Desk requires a contact on every ticket, so
-      the web chat widget must collect name and email before connecting. Once one chat
-      engagement has flowed through with that enabled, read its `consumers[0]` from the KV
-      `webhook:` record to get the real field names, then wire identity resolution and lift
-      the ticket block out of `if (callerPhone)`. Do not guess the field names in advance.
+   a. **Add the HTTP Request widget** to the `Customer Service WebChat` flow
+      (`hbHFsRuzRo6PkHq_y9dh6Q`) so it posts the collected identity. If the flow isn't
+      collecting name/email yet, enable pre-chat capture first.
 
-   b. **Queue dispositions.** `Customer Service Messaging` should use the same disposition
-      set as the Customer Service voice queue. The worker already routes it correctly —
-      queue name contains "customer", so it gets the CS department and `cf_inquiry_type_2`,
-      and all seven CS dispositions map today. But the queue is currently configured in
-      Zoom with Tech Support values (`Internal`, `Customer Service`), which have no CS
-      mapping and would drop the ticket even once identity is solved. Fix the disposition
-      list on the Zoom queue; no code change.
+   b. **Fix the queue's dispositions.** `Customer Service Messaging` is meant to carry the
+      same set as the CS voice queue and the worker already routes it that way, but it is
+      configured in Zoom with Tech Support values (`Internal`, `Customer Service`) which
+      have no CS mapping — so a chat would still drop at the Inquiry Type step even with
+      identity solved.
 
-   Also note `buildDeskTicketPayload` hardcodes `channel: "Phone"` and puts `phone` on the
-   ticket and the inline contact — both need to become channel-aware when chat tickets go in.
+   Until both are done, chat engagements record `no_caller_identity` and alert rather than
+   creating tickets. Chat is low volume so far: 2 of 155 engagements in the 08-24..08-28
+   window.
 
 2. **Set `ZOHO_DESK_DEFAULT_DEPARTMENT_ID`** — so an unrecognized queue lands somewhere a
    human will see instead of failing closed. The `desk_dropped` alert now catches this case,
