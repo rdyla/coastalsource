@@ -34,6 +34,7 @@ async function handleZohoRoutes(request, env, ctx, url) {
     "GET /zoho/leads": handleLeads,
     "GET /zoho/account-summary": handleAccountSummary,
     "GET /zoho/lookup-by-phone": handleLookupByPhone,
+    "GET /zoho/lookup-by-email": handleLookupByEmail,
     "POST /zoho/create-contact": handleCreateContact,
     "GET /zoho/desk/agents": handleDeskAgentsProbe,
   };
@@ -371,6 +372,14 @@ async function processEngagementWebhook(env, data) {
         } catch (err) {
           console.log("Zoho phone lookup failed:", String(err?.message || err));
         }
+      } else if (callerEmail) {
+        // Chat: resolve the CRM contact by email so the ticket gets a real
+        // contact name and account linkage rather than just a raw address.
+        try {
+          phoneLookupResult = await lookupZohoByEmail(env, callerEmail);
+        } catch (err) {
+          console.log("Zoho email lookup failed:", String(err?.message || err));
+        }
       }
 
       // Resolve the Zoom agent to Zoho identities (CRM user + Desk agent) once,
@@ -667,6 +676,21 @@ async function handleChatIdentity(request, env, url) {
     has_name: Boolean(name || firstName || lastName),
   }));
 
+  // Resolve against Zoho and hand the match straight back, so the flow gets
+  // its screen-pop data from the same call that stores the identity. Purely
+  // additive — a lookup failure must not lose the capture we just wrote.
+  // Pass lookup=false to skip it.
+  let lookup = null;
+  let lookupError = null;
+  if (url.searchParams.get("lookup") !== "false" && (email || phone)) {
+    try {
+      lookup = email ? await lookupZohoByEmail(env, email) : await lookupZohoByPhone(env, phone);
+    } catch (err) {
+      lookupError = String(err?.message || err);
+      console.log("Chat identity Zoho lookup failed:", lookupError);
+    }
+  }
+
   return json({
     ok: true,
     stored: true,
@@ -677,6 +701,8 @@ async function handleChatIdentity(request, env, url) {
       name: Boolean(name || firstName || lastName),
     },
     expires_in_seconds: ttl,
+    lookup,
+    lookup_error: lookupError,
   });
 }
 
@@ -1230,6 +1256,12 @@ async function handleLookupByPhone(request, env, ctx, url) {
   return json(await lookupZohoByPhone(env, phoneRaw));
 }
 
+async function handleLookupByEmail(request, env, ctx, url) {
+  const emailRaw = url.searchParams.get("email");
+  if (!emailRaw) return json({ error: "Missing query param", required: ["email"] }, 400);
+  return json(await lookupZohoByEmail(env, emailRaw));
+}
+
 async function handleDeskAgentsProbe(request, env, ctx, url) {
   const email = (url.searchParams.get("email") || "").trim().toLowerCase();
   const accessToken = await getZohoAccessToken(env);
@@ -1468,6 +1500,77 @@ async function lookupZohoByPhone(env, phoneRaw) {
   }
 
   return { found: false, match_type: null, contact: null, account: null };
+}
+
+async function tryFindContactByEmail(env, token, email) {
+  // Secondary_Email is not always searchable on every org, so tolerate the
+  // "field is not available for search" rejection the same way the phone
+  // lookup does and fall through to the next field.
+  const fieldsToTry = ["Email", "Secondary_Email"];
+
+  for (const field of fieldsToTry) {
+    const criteria = `(${field}:equals:${email})`;
+    const zohoUrl =
+      `https://www.zohoapis.com/crm/v2/Contacts/search?criteria=` +
+      encodeURIComponent(criteria);
+
+    try {
+      const zohoJson = await callZoho(env, token, zohoUrl);
+      if (Array.isArray(zohoJson.data) && zohoJson.data.length > 0) {
+        return zohoJson.data[0];
+      }
+    } catch (err) {
+      if (
+        err?.details?.code === "INVALID_QUERY" &&
+        err?.details?.details?.reason?.includes("field is not available for search")
+      ) {
+        continue;
+      }
+      throw err;
+    }
+  }
+  return null;
+}
+
+// Email equivalent of lookupZohoByPhone, returning the same shape so callers
+// and the popup can treat a chat match and a call match identically.
+async function lookupZohoByEmail(env, emailRaw) {
+  const email = String(emailRaw || "").trim();
+  if (!email) return { found: false, match_type: null, email_normalized: null };
+
+  const accessToken = await getZohoAccessToken(env);
+  const contact = await tryFindContactByEmail(env, accessToken, email);
+  if (!contact) {
+    return { found: false, match_type: null, email_normalized: email };
+  }
+
+  const accountId = contact?.Account_Name?.id || null;
+  let accountSummary = null;
+  if (accountId) {
+    accountSummary = await fetchAccountSummaryById(env, accessToken, accountId);
+  }
+
+  return {
+    found: true,
+    match_type: "contact",
+    email_normalized: email,
+    contact: {
+      id: contact.id,
+      name:
+        contact.Full_Name ||
+        [contact.First_Name, contact.Last_Name].filter(Boolean).join(" ") ||
+        null,
+      email: contact.Email ?? null,
+      phone: contact.Phone ?? null,
+      mobile: contact.Mobile ?? null,
+      rep: contact.Rep ?? null,
+      account_id: accountId,
+      account_name: contact?.Account_Name?.name ?? null,
+      owner_name: contact?.Owner?.name ?? null,
+      modified_time: contact.Modified_Time ?? null,
+    },
+    account: accountSummary,
+  };
 }
 
 async function tryFindContactByPhone(env, token, phoneCandidate) {
