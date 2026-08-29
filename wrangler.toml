@@ -7,3 +7,8 @@ account_id = "521c322a89a17bb69f91f1e65177606e"
 [[kv_namespaces]]
 binding = "coastalsource_kv"
 id = "5e7000fe8fba49b69a998298f7c6c476"
+
+# Refuses to deploy a dirty tree, or one that isn't exactly origin/main.
+# Runs on every build, dev and --dry-run included; PREDEPLOY_SKIP=1 bypasses.
+[build]
+command = "node scripts/predeploy.mjs"
