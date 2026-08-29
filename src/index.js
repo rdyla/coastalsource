@@ -415,6 +415,14 @@ async function processEngagementWebhook(env, data) {
           }
         }
       }
+    } else {
+      // Chat/messaging engagements carry no consumer_number, so the whole
+      // ticket block above is skipped. Record it explicitly — otherwise the
+      // engagement produces no ticket, no error, and no alert, and the KV
+      // record looks like a success with a null ticket id.
+      deskTicketError =
+        "no caller phone — chat/messaging engagement, ticket creation skipped";
+      deskDroppedReason = "no_caller_phone";
     }
 
     // Dispatch the Desk ticket if enabled and we still own this engagement
