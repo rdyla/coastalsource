@@ -2360,7 +2360,14 @@ function buildDeskTicketPayload({
       const parsed = parseStructuredNote(n.note);
       const displayText = parsed ? parsed.note : n.note;
       if (displayText) {
-        noteLines.push(`- ${escapeHtml(displayText)} (${escapeHtml(author)}${escapeHtml(ts)})`);
+        // Escape first, then turn the note's own newlines into <br> — Desk
+        // renders description as HTML, so a multi-line note would otherwise
+        // collapse into one run-on line. Continuation lines are indented so
+        // they read as part of the bullet.
+        const bodyHtml = escapeHtml(displayText)
+          .replace(/\r\n?/g, "\n")
+          .replace(/\n/g, "<br>&nbsp;&nbsp;");
+        noteLines.push(`- ${bodyHtml} (${escapeHtml(author)}${escapeHtml(ts)})`);
       }
     }
     if (noteLines.length > 0) {
