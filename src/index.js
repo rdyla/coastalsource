@@ -106,6 +106,15 @@ async function handleZoomRoutes(request, env, ctx, url) {
     return handleSupervisorAssist(request, env, url);
   }
 
+  // Chat/messaging engagements carry no consumer_number, so the flow pushes
+  // whatever it collected here and the disposition webhook reads it back.
+  if (
+    assistPath === "/zoom/chat-identity" &&
+    (request.method === "POST" || request.method === "GET")
+  ) {
+    return handleChatIdentity(request, env, url);
+  }
+
   if (url.pathname === "/zoom/webhooks/recent" && request.method === "GET") {
     return handleWebhooksRecent(request, env);
   }
@@ -335,12 +344,33 @@ async function processEngagementWebhook(env, data) {
     // values and routes accordingly.
     engagementDetails = resolveEngagementContext(engagementDetails, parsedBody?.payload?.object);
 
-    const callerPhone = engagementDetails?.consumers?.[0]?.consumer_number || null;
-    if (callerPhone) {
+    const consumerPhone = engagementDetails?.consumers?.[0]?.consumer_number || null;
+
+    // Chat/messaging engagements have no consumer_number. If the flow pushed
+    // what it collected to /zoom/chat-identity we can still identify the
+    // customer and open a ticket; otherwise there is nothing to attach one to.
+    let chatIdentity = null;
+    if (!consumerPhone && env.coastalsource_kv) {
       try {
-        phoneLookupResult = await lookupZohoByPhone(env, callerPhone);
+        chatIdentity = await env.coastalsource_kv.get(`chat_identity:${engagementId}`, {
+          type: "json",
+        });
+        if (chatIdentity) console.log("Chat identity found for", engagementId);
       } catch (err) {
-        console.log("Zoho phone lookup failed:", String(err?.message || err));
+        console.log("Chat identity lookup failed:", String(err?.message || err));
+      }
+    }
+
+    const callerPhone = consumerPhone || chatIdentity?.phone || null;
+    const callerEmail = chatIdentity?.email || null;
+
+    if (callerPhone || callerEmail) {
+      if (callerPhone) {
+        try {
+          phoneLookupResult = await lookupZohoByPhone(env, callerPhone);
+        } catch (err) {
+          console.log("Zoho phone lookup failed:", String(err?.message || err));
+        }
       }
 
       // Resolve the Zoom agent to Zoho identities (CRM user + Desk agent) once,
@@ -400,9 +430,14 @@ async function processEngagementWebhook(env, data) {
         } else {
           try {
             const zohoToken = await getZohoAccessToken(env);
-            deskContactFound = await findZohoDeskContactByPhone(env, zohoToken, callerPhone);
+            deskContactFound = callerPhone
+              ? await findZohoDeskContactByPhone(env, zohoToken, callerPhone)
+              : await findZohoDeskContactByEmail(env, zohoToken, callerEmail);
             deskTicketPayload = buildDeskTicketPayload({
               phone: callerPhone,
+              email: callerEmail,
+              chatIdentity,
+              channelTypes: engagementDetails?.channel_types,
               engagementDetails,
               phoneLookup: phoneLookupResult,
               deskContact: deskContactFound,
@@ -416,13 +451,14 @@ async function processEngagementWebhook(env, data) {
         }
       }
     } else {
-      // Chat/messaging engagements carry no consumer_number, so the whole
-      // ticket block above is skipped. Record it explicitly — otherwise the
-      // engagement produces no ticket, no error, and no alert, and the KV
-      // record looks like a success with a null ticket id.
-      deskTicketError =
-        "no caller phone — chat/messaging engagement, ticket creation skipped";
-      deskDroppedReason = "no_caller_phone";
+      // No phone and no captured chat identity — nothing to attach a Desk
+      // contact to, and Desk requires one. Record it so the engagement doesn't
+      // vanish: without this it produces no ticket, no error and no alert, and
+      // the KV record looks like a success with a null ticket id.
+      deskTicketError = consumerPhone
+        ? "no caller identity — ticket creation skipped"
+        : "no caller identity — chat/messaging engagement with nothing posted to /zoom/chat-identity";
+      deskDroppedReason = "no_caller_identity";
     }
 
     // Dispatch the Desk ticket if enabled and we still own this engagement
@@ -543,6 +579,105 @@ async function processEngagementWebhook(env, data) {
       });
     }
   }
+}
+
+// Identity capture for chat/messaging engagements. Zoom's engagement API
+// exposes no consumer email or phone for web chat — the flow's Variable values
+// are not returned — so the flow POSTs what it collected here at the start of
+// the chat, and processEngagementWebhook reads it back at disposition time.
+//
+// Field names are ours, not Zoom's, and every one accepts aliases so the flow
+// widget can send whatever shape is convenient.
+async function handleChatIdentity(request, env, url) {
+  let body = null;
+  if (request.method === "POST") {
+    try {
+      body = await request.json();
+    } catch {
+      body = null;
+    }
+  }
+
+  const pick = (...names) => {
+    for (const n of names) {
+      const fromQuery = url.searchParams.get(n);
+      if (fromQuery && String(fromQuery).trim()) return String(fromQuery).trim();
+      const fromBody = body?.[n];
+      if (fromBody !== undefined && fromBody !== null && String(fromBody).trim()) {
+        return String(fromBody).trim();
+      }
+    }
+    return null;
+  };
+
+  const engagementId = pick("e", "engagement_id", "engagementId", "engagement", "id");
+  if (!engagementId) {
+    return json(
+      {
+        ok: false,
+        error: "engagement id required",
+        accepted: ["e", "engagement_id", "engagementId", "engagement", "id"],
+        via: "query string or JSON body",
+      },
+      400
+    );
+  }
+
+  const email = pick("email", "e_mail", "consumer_email", "customer_email");
+  const phone = pick("phone", "consumer_phone", "customer_phone", "mobile");
+  const firstName = pick("first_name", "firstName", "given_name");
+  const lastName = pick("last_name", "lastName", "surname", "family_name");
+  const name = pick("name", "full_name", "fullName", "consumer_name", "customer_name");
+
+  if (!email && !phone && !name && !firstName && !lastName) {
+    return json(
+      {
+        ok: false,
+        error: "no identity fields supplied",
+        accepted: ["email", "phone", "name", "first_name", "last_name"],
+        engagement_id: engagementId,
+      },
+      400
+    );
+  }
+
+  if (!env.coastalsource_kv) return json({ ok: false, error: "KV not bound" }, 500);
+
+  const record = {
+    engagement_id: engagementId,
+    email,
+    phone,
+    name,
+    first_name: firstName,
+    last_name: lastName,
+    captured_at: new Date().toISOString(),
+  };
+
+  // Short TTL — this is customer PII and the disposition normally lands within
+  // minutes. A day is generous cover for a late wrap-up.
+  const ttl = Number(env.CHAT_IDENTITY_TTL_SECONDS) || 60 * 60 * 24;
+  await env.coastalsource_kv.put(`chat_identity:${engagementId}`, JSON.stringify(record), {
+    expirationTtl: ttl,
+  });
+
+  console.log("Chat identity captured:", JSON.stringify({
+    engagement_id: engagementId,
+    has_email: Boolean(email),
+    has_phone: Boolean(phone),
+    has_name: Boolean(name || firstName || lastName),
+  }));
+
+  return json({
+    ok: true,
+    stored: true,
+    engagement_id: engagementId,
+    captured: {
+      email: Boolean(email),
+      phone: Boolean(phone),
+      name: Boolean(name || firstName || lastName),
+    },
+    expires_in_seconds: ttl,
+  });
 }
 
 // Supervisor assist: an agent asks for help mid-call, and we post an enriched
@@ -1782,6 +1917,22 @@ async function findZohoDeskAgentByEmail(env, accessToken, email) {
   return null;
 }
 
+async function findZohoDeskContactByEmail(env, accessToken, email) {
+  const clean = String(email || "").trim();
+  if (!clean) return null;
+  try {
+    const data = await callZohoDesk(
+      env,
+      accessToken,
+      `/contacts/search?email=${encodeURIComponent(clean)}`
+    );
+    if (Array.isArray(data?.data) && data.data.length > 0) return data.data[0];
+  } catch (err) {
+    console.log("Desk contact search by email failed:", String(err?.message || err));
+  }
+  return null;
+}
+
 async function findZohoDeskContactByPhone(env, accessToken, phone) {
   const digits = String(phone || "").replace(/\D/g, "");
   if (!digits) return null;
@@ -1973,13 +2124,22 @@ function buildInquiryTypeCustomField(engagementDetails) {
 
 function buildDeskTicketPayload({
   phone,
+  email,
+  chatIdentity,
+  channelTypes,
   engagementDetails,
   phoneLookup,
   deskContact,
   departmentId,
   assigneeId,
 }) {
-  const contactName = phoneLookup?.contact?.name || "Unknown Caller";
+  const isChat = Array.isArray(channelTypes) && channelTypes.includes("chat");
+  const identityName =
+    chatIdentity?.name ||
+    [chatIdentity?.first_name, chatIdentity?.last_name].filter(Boolean).join(" ") ||
+    null;
+  const contactName =
+    phoneLookup?.contact?.name || identityName || (isChat ? "Unknown Chat Visitor" : "Unknown Caller");
   const agent = engagementDetails?.agents?.[0];
   const queue = engagementDetails?.queues?.[0];
 
@@ -2039,7 +2199,8 @@ function buildDeskTicketPayload({
   // and escape user-supplied values to prevent any HTML injection.
   const lines = [];
   lines.push(`<b>Engagement ID:</b> ${escapeHtml(engagementDetails?.engagement_id ?? "-")}`);
-  lines.push(`<b>Phone:</b> ${escapeHtml(phone)}`);
+  if (phone) lines.push(`<b>Phone:</b> ${escapeHtml(phone)}`);
+  if (isChat) lines.push(`<b>Channel:</b> Chat`);
   lines.push(`<b>Direction:</b> ${escapeHtml(engagementDetails?.direction ?? "-")}`);
   if (agent) lines.push(`<b>Agent:</b> ${escapeHtml(agent.display_name || "-")}`);
   if (queue) lines.push(`<b>Queue:</b> ${escapeHtml(queue.queue_name)}`);
@@ -2075,11 +2236,11 @@ function buildDeskTicketPayload({
     subject,
     description: lines.join("<br>"),
     departmentId: String(departmentId),
-    channel: "Phone",
-    phone,
+    channel: isChat ? "Chat" : "Phone",
     priority: "Medium",
     status: overrideStatus || "Open",
   };
+  if (phone) ticket.phone = phone;
 
   if (assigneeId) {
     ticket.assigneeId = String(assigneeId);
@@ -2097,7 +2258,9 @@ function buildDeskTicketPayload({
   // fall back to whatever the Desk contact lookup surfaced.
   const emailFromCrm = phoneLookup?.contact?.email || null;
   const emailFromDesk = deskContact?.email || null;
-  const ticketEmail = emailFromCrm || emailFromDesk;
+  // For chat the flow-supplied address is the only one we have, so it wins
+  // when there was no CRM match to prefer.
+  const ticketEmail = emailFromCrm || emailFromDesk || email || null;
   if (ticketEmail) {
     ticket.email = ticketEmail;
   }
@@ -2110,10 +2273,14 @@ function buildDeskTicketPayload({
   } else {
     const { firstName, lastName } = splitName(contactName);
     ticket.contact = {
-      lastName: lastName || "Unknown Caller",
-      phone,
+      lastName: lastName || (isChat ? "Unknown Chat Visitor" : "Unknown Caller"),
     };
-    if (firstName) ticket.contact.firstName = firstName;
+    if (chatIdentity?.first_name) ticket.contact.firstName = chatIdentity.first_name;
+    else if (firstName) ticket.contact.firstName = firstName;
+    if (chatIdentity?.last_name) ticket.contact.lastName = chatIdentity.last_name;
+    // Desk needs at least one reachable field on a new contact; chat has no
+    // phone, so the email carries it.
+    if (phone) ticket.contact.phone = phone;
     if (ticketEmail) ticket.contact.email = ticketEmail;
   }
 
