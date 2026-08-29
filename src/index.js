@@ -95,6 +95,17 @@ async function handleZoomRoutes(request, env, ctx, url) {
   const authErr = requireApiKey(request, env);
   if (authErr) return authErr;
 
+  // Supervisor assist is triggered from a Zoom flow widget and by hand, so
+  // accept either method and tolerate case and trailing-slash variations.
+  let assistPath = url.pathname.toLowerCase();
+  while (assistPath.endsWith("/")) assistPath = assistPath.slice(0, -1);
+  if (
+    assistPath === "/zoom/supervisorassist" &&
+    (request.method === "POST" || request.method === "GET")
+  ) {
+    return handleSupervisorAssist(request, env, url);
+  }
+
   if (url.pathname === "/zoom/webhooks/recent" && request.method === "GET") {
     return handleWebhooksRecent(request, env);
   }
@@ -526,6 +537,150 @@ async function processEngagementWebhook(env, data) {
   }
 }
 
+// Supervisor assist: an agent asks for help mid-call, and we post an enriched
+// summary into the supervisor Zoom chat. Accepts the engagement id from either
+// the query string or a JSON body under any of several names, because the Zoom
+// flow widget and manual callers spell it differently.
+async function handleSupervisorAssist(request, env, url) {
+  let body = null;
+  if (request.method === "POST") {
+    try {
+      body = await request.json();
+    } catch {
+      body = null;
+    }
+  }
+
+  const pick = (...names) => {
+    for (const n of names) {
+      const fromQuery = url.searchParams.get(n);
+      if (fromQuery && String(fromQuery).trim()) return String(fromQuery).trim();
+      const fromBody = body?.[n];
+      if (fromBody !== undefined && fromBody !== null && String(fromBody).trim()) {
+        return String(fromBody).trim();
+      }
+    }
+    return null;
+  };
+
+  const engagementId = pick("e", "engagement_id", "engagementId", "engagement", "id");
+  const reason = pick("reason", "message", "summary", "note", "text", "r");
+  const requestedBy = pick("requested_by", "requestedBy", "agent", "agent_name", "user");
+
+  if (!engagementId) {
+    return json(
+      {
+        ok: false,
+        error: "engagement id required",
+        accepted: ["e", "engagement_id", "engagementId", "engagement", "id"],
+        via: "query string or JSON body",
+      },
+      400
+    );
+  }
+
+  const webhookUrl = env.SUPERVISOR_WEBHOOK_URL;
+  const webhookSecret = env.SUPERVISOR_WEBHOOK_SECRET;
+  if (!webhookUrl) {
+    return json({ ok: false, error: "SUPERVISOR_WEBHOOK_URL not configured" }, 503);
+  }
+
+  // One assist per engagement per window — an agent hammering the button
+  // shouldn't spam the supervisor channel.
+  const dedupeKey = `supervisor_assist:${engagementId}`;
+  const dedupeTtl = Number(env.SUPERVISOR_ASSIST_DEDUPE_SECONDS) || 900;
+  if (env.coastalsource_kv && dedupeTtl > 0) {
+    const already = await env.coastalsource_kv.get(dedupeKey);
+    if (already) {
+      console.log(`Supervisor assist suppressed for ${engagementId} — alerted at ${already}`);
+      return json({
+        ok: true,
+        sent: false,
+        duplicate: true,
+        engagement_id: engagementId,
+        first_alerted_at: already,
+      });
+    }
+  }
+
+  // Enrich best-effort — a failed lookup still posts, just with less context.
+  let details = null;
+  let fetchError = null;
+  try {
+    details = await fetchZoomEngagement(env, engagementId);
+  } catch (err) {
+    fetchError = String(err?.message || err);
+    console.log("Supervisor assist engagement fetch failed:", fetchError);
+  }
+
+  const callerPhone = details?.consumers?.[0]?.consumer_number || null;
+  const agent = details?.agents?.[0] || null;
+  const queue = details?.queues?.[0] || null;
+
+  let lookup = null;
+  if (callerPhone) {
+    try {
+      lookup = await lookupZohoByPhone(env, callerPhone);
+    } catch (err) {
+      console.log("Supervisor assist Zoho lookup failed:", String(err?.message || err));
+    }
+  }
+  const contactName = lookup?.contact?.name || null;
+  const accountName = lookup?.account?.account_name || lookup?.contact?.account_name || null;
+  const dealerTier = lookup?.account?.dealer_tier || null;
+
+  const lines = [];
+  lines.push("🔔 Supervisor assist requested");
+  lines.push("");
+  if (reason) lines.push(`Reason: ${reason}`);
+  if (requestedBy) lines.push(`Requested by: ${requestedBy}`);
+  lines.push(`Agent: ${agent?.display_name || requestedBy || "-"}`);
+  lines.push(`Queue: ${queue?.queue_name || "-"}`);
+  lines.push(`Caller: ${callerPhone || "-"}${contactName ? ` — ${contactName}` : ""}`);
+  if (accountName) {
+    lines.push(`Account: ${accountName}${dealerTier ? ` (${dealerTier})` : ""}`);
+  }
+  lines.push(`Direction: ${details?.direction || "-"}`);
+  lines.push(`Started: ${details?.start_time || "-"}`);
+  if (details?.waiting_duration != null) lines.push(`Waited: ${details.waiting_duration}s`);
+  if (details?.talk_duration != null) lines.push(`Talk time: ${details.talk_duration}s`);
+  lines.push(`Engagement: ${engagementId}`);
+  if (callerPhone) {
+    const origin = new URL(request.url).origin;
+    lines.push(
+      `Zoho: ${origin}/popup?phone=${encodeURIComponent(callerPhone)}&engagement_id=${encodeURIComponent(engagementId)}`
+    );
+  }
+  if (fetchError) lines.push(`(engagement lookup failed: ${fetchError})`);
+
+  try {
+    await postZoomChat(webhookUrl, webhookSecret, lines.join("\n"));
+  } catch (err) {
+    const msg = String(err?.message || err);
+    console.log("Supervisor assist chat post failed:", msg);
+    return json({ ok: false, sent: false, engagement_id: engagementId, error: msg }, 502);
+  }
+
+  if (env.coastalsource_kv && dedupeTtl > 0) {
+    await env.coastalsource_kv.put(dedupeKey, new Date().toISOString(), {
+      expirationTtl: dedupeTtl,
+    });
+  }
+
+  console.log("Supervisor assist alert sent:", engagementId);
+  return json({
+    ok: true,
+    sent: true,
+    engagement_id: engagementId,
+    channel: "supervisor",
+    enriched: Boolean(details),
+    caller: callerPhone,
+    contact_name: contactName,
+    account_name: accountName,
+    fetch_error: fetchError,
+  });
+}
+
 // Fan an alert out to whichever channels are configured, with a per-type
 // cooldown in KV so a sustained outage doesn't mail out on every call.
 // `force: true` bypasses the cooldown (used by /zoom/alert-test).
@@ -580,16 +735,20 @@ async function sendZoomChatAlert(env, summary, details) {
     .map(([k, v]) => `${k}: ${v}`)
     .join("\n");
   const text = `⚠️ Coastal Source Worker — ${summary}\n\n${detailLines}`;
+  await postZoomChat(env.ALERT_ZOOM_WEBHOOK_URL, env.ALERT_ZOOM_WEBHOOK_SECRET, text);
+}
 
-  const u = new URL(env.ALERT_ZOOM_WEBHOOK_URL);
+// Shared Zoom chat poster — used by both the worker alert channel and the
+// supervisor-assist route, which post to different webhooks.
+async function postZoomChat(webhookUrl, webhookSecret, text) {
+  if (!webhookUrl) throw new Error("Zoom chat webhook URL not configured");
+  const u = new URL(webhookUrl);
   u.searchParams.set("format", "message");
   const headers = { "Content-Type": "text/plain" };
-  if (env.ALERT_ZOOM_WEBHOOK_SECRET) {
-    headers.Authorization = env.ALERT_ZOOM_WEBHOOK_SECRET;
-  }
+  if (webhookSecret) headers.Authorization = webhookSecret;
 
   const res = await fetch(u.toString(), { method: "POST", headers, body: text });
-  if (!res.ok) throw new Error(`Zoom chat alert failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`Zoom chat post failed: ${res.status} ${await res.text()}`);
 }
 
 async function sendResendEmailAlert(env, summary, details) {
