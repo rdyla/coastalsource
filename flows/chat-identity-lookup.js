@@ -22,13 +22,23 @@ async function main () {
     var email = vars["crm_email"] || vars["global_custom.Custom.crm_email"] || "";
 
     // 2. Engagement id. global_system.Engagement.engagementId is the name for
-    //    this org (note the lower-case leading "e" — that casing is why the
-    //    first attempt came through empty). The other spellings and the scan
-    //    below are kept as a safety net: scan every variable
+    //    this org, but if var_get() does not expose system variables at this
+    //    point in the flow it will read as empty regardless of the name being
+    //    right. The reliable fix is to copy it into a custom variable in the
+    //    Variable widget that already runs at the start of this flow:
+    //
+    //        global_custom.Custom.engagement_id = global_system.Engagement.engagementId
+    //
+    //    That is checked first below. The system spellings and the scan are
+    //    kept as a safety net: scan every variable
     //    whose name mentions "engagement" for a value shaped like a Zoom
     //    engagement id (22-ish chars of base64url, e.g. 066UYqbRS0qRNbsUj9ZoBw).
     var engagementId =
-      vars["global_system.Engagement.engagementId"] ||   // confirmed for this org
+      // Set by the Variable widget — see note above. Checked first because it
+      // works regardless of whether var_get() exposes system variables here.
+      vars["global_custom.Custom.engagement_id"] ||
+      vars["engagement_id"] ||
+      vars["global_system.Engagement.engagementId"] ||   // confirmed name for this org
       vars["global_system.Engagement.EngagementID"] ||
       vars["global_system.Engagement.EngagementId"] ||
       vars["global_system.Engagement.ID"] ||
@@ -53,6 +63,9 @@ async function main () {
 
     if (!engagementId) {
       // Nothing matched — dump names AND values so the right one is obvious.
+      // If global_system.* names are absent from this dump entirely, var_get()
+      // is not exposing system variables here: set
+      // global_custom.Custom.engagement_id in the Variable widget instead.
       log.error("No engagement id found. Variables: " + JSON.stringify(vars));
     }
     if (!email) {
