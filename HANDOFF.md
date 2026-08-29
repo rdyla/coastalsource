@@ -153,6 +153,15 @@ The **Warranty** queue (`ZWQ5300518494B9414472F2EF51769E4DD2`, flow `Warranty_Vo
 `Technical Support_SMS` both route here too, so their dispositions must exist in this same
 picklist. Observed from the Warranty queue so far: `Warranty`, `Tech Support`.
 
+### Customer Service Messaging queue
+
+`ZWQ900406F09AC9706C98819241120DFEB5`, `channel_types: ["chat"]`, `channel_source: web_chat`.
+Name contains "customer", so it already routes to the CS department and `cf_inquiry_type_2`
+— it is meant to carry the **same dispositions as the Customer Service voice queue**. As of
+2026-08-28 it is misconfigured in Zoom with Tech Support values (`Internal`,
+`Customer Service`), which have no CS mapping. Fix the queue's disposition list in Zoom; the
+worker needs no change.
+
 ### Skip dispositions (both queues)
 
 - `No Ticket Needed` — webhook is processed and recorded, but no Desk ticket is created
@@ -263,22 +272,30 @@ error field — filter out `intentionally skipped` before counting failures.
 
 ## Possible follow-ups (none blocking)
 
-1. **Chat engagements are dropped silently, and no alert covers it.** The entire Desk-ticket
-   block in `processEngagementWebhook` is nested inside `if (callerPhone)`, and `callerPhone`
-   comes from `consumers[0].consumer_number` — which chat engagements don't have. So a chat
-   disposition sets no `desk_ticket_error`, builds no payload, creates no ticket, and never
-   sets `deskDroppedReason`, meaning even the `desk_dropped` alert can't fire. The KV record
-   is the only trace and it looks like a success apart from a null ticket id.
+1. **Chat/messaging tickets — blocked on two Zoom-side config changes.** As of 2026-08-28
+   chat engagements are recorded and alerted (`desk_dropped:no_caller_phone:<queue>`) but
+   still produce no Desk ticket. The worker side needs no further change until Zoom is
+   configured:
 
-   Seen on the **Customer Service Messaging** queue
-   (`ZWQ900406F09AC9706C98819241120DFEB5`, `channel_types: ["chat"]`): two engagements on
-   2026-08-27 (`066UYqbRS0qRNbsUj9ZoBw` disposition `Internal`, `-CeObgneRUituUl3xYbGbw`
-   disposition `Customer Service`).
+   a. **Pre-chat identity.** Anonymous web chat supplies nothing usable — no email, no
+      phone, and `consumer_display_name` is the literal string `"Consumer"`. The
+      `consumer_id` is *not* per-person either: two separate 2026-08-27 engagements both
+      carried `P3PxHzMHTpmf5Dd7JfI-HQ`. Zoho Desk requires a contact on every ticket, so
+      the web chat widget must collect name and email before connecting. Once one chat
+      engagement has flowed through with that enabled, read its `consumers[0]` from the KV
+      `webhook:` record to get the real field names, then wire identity resolution and lift
+      the ticket block out of `if (callerPhone)`. Do not guess the field names in advance.
 
-   Two decisions needed: should chat engagements create Desk tickets at all, and if so what
-   identifies the contact in place of a phone number. Note both dispositions above are Tech
-   Support picklist values on a queue whose name matches "customer", so even once the phone
-   guard is handled the Inquiry Type mapping would fail for them.
+   b. **Queue dispositions.** `Customer Service Messaging` should use the same disposition
+      set as the Customer Service voice queue. The worker already routes it correctly —
+      queue name contains "customer", so it gets the CS department and `cf_inquiry_type_2`,
+      and all seven CS dispositions map today. But the queue is currently configured in
+      Zoom with Tech Support values (`Internal`, `Customer Service`), which have no CS
+      mapping and would drop the ticket even once identity is solved. Fix the disposition
+      list on the Zoom queue; no code change.
+
+   Also note `buildDeskTicketPayload` hardcodes `channel: "Phone"` and puts `phone` on the
+   ticket and the inline contact — both need to become channel-aware when chat tickets go in.
 
 2. **Set `ZOHO_DESK_DEFAULT_DEPARTMENT_ID`** — so an unrecognized queue lands somewhere a
    human will see instead of failing closed. The `desk_dropped` alert now catches this case,
