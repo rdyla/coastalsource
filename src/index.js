@@ -607,12 +607,14 @@ async function handleChatIdentity(request, env, url) {
     }
   }
 
+  // Drop placeholders here too, so a flow sending an unpopulated variable is
+  // rejected rather than having "undefined" stored as the customer's email.
   const pick = (...names) => {
     for (const n of names) {
       const fromQuery = url.searchParams.get(n);
-      if (fromQuery && String(fromQuery).trim()) return String(fromQuery).trim();
+      if (fromQuery && !isPlaceholderValue(fromQuery)) return String(fromQuery).trim();
       const fromBody = body?.[n];
-      if (fromBody !== undefined && fromBody !== null && String(fromBody).trim()) {
+      if (fromBody !== undefined && fromBody !== null && !isPlaceholderValue(fromBody)) {
         return String(fromBody).trim();
       }
     }
@@ -637,6 +639,13 @@ async function handleChatIdentity(request, env, url) {
   const firstName = pick("first_name", "firstName", "given_name");
   const lastName = pick("last_name", "lastName", "surname", "family_name");
   const name = pick("name", "full_name", "fullName", "consumer_name", "customer_name");
+
+  if (email && !email.includes("@")) {
+    return json(
+      { ok: false, error: "not an email address", received: email, engagement_id: engagementId },
+      400
+    );
+  }
 
   if (!email && !phone && !name && !firstName && !lastName) {
     return json(
@@ -1252,13 +1261,26 @@ async function handleLeads(request, env, ctx, url) {
 
 async function handleLookupByPhone(request, env, ctx, url) {
   const phoneRaw = url.searchParams.get("phone");
-  if (!phoneRaw) return json({ error: "Missing query param", required: ["phone"] }, 400);
+  if (!phoneRaw || isPlaceholderValue(phoneRaw)) {
+    return json({ error: "Missing query param", required: ["phone"], received: phoneRaw }, 400);
+  }
+  if (!String(phoneRaw).replace(/\D/g, "")) {
+    return json(
+      { error: "phone contains no digits", received: phoneRaw, hint: "chat engagements have no phone — use /zoho/lookup-by-email or /zoom/chat-identity" },
+      400
+    );
+  }
   return json(await lookupZohoByPhone(env, phoneRaw));
 }
 
 async function handleLookupByEmail(request, env, ctx, url) {
   const emailRaw = url.searchParams.get("email");
-  if (!emailRaw) return json({ error: "Missing query param", required: ["email"] }, 400);
+  if (!emailRaw || isPlaceholderValue(emailRaw)) {
+    return json({ error: "Missing query param", required: ["email"], received: emailRaw }, 400);
+  }
+  if (!String(emailRaw).includes("@")) {
+    return json({ error: "not an email address", received: emailRaw }, 400);
+  }
   return json(await lookupZohoByEmail(env, emailRaw));
 }
 
@@ -1750,6 +1772,15 @@ function requireApiKey(request, env) {
     return json({ error: "Unauthorized" }, 401);
   }
   return null;
+}
+
+// Flow widgets stringify unset variables, so an unpopulated field arrives as
+// the literal "undefined" or "null" rather than as an empty value. Treat those
+// as absent so a misconfigured flow gets a 400 it can see, instead of a
+// confident "no match" for a query that was never valid.
+function isPlaceholderValue(v) {
+  const t = String(v ?? "").trim().toLowerCase();
+  return t === "" || t === "undefined" || t === "null" || t === "nil" || t === "none";
 }
 
 function buildPhoneCandidates(digits) {
