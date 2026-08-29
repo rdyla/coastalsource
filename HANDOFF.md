@@ -1,14 +1,17 @@
 # Handoff — pick-up notes
 
-Last touched 2026-08-05 via commit `0021bd8`.
+Last touched 2026-08-28 via commit `9f8bcdf`.
 
-> **Deploy state:** repo verified in sync with production on 2026-08-05 (version
-> `87af1c31`).
+> **Deploy state:** as of 2026-08-28 the repo is AHEAD of production. `main` has the
+> `desk_dropped` alerting from `0021bd8`; the running version does not, because the
+> 2026-08-25 deploy was built from a base predating it and reverted it. Deploy from `main`
+> to restore it.
 >
-> **Check this before you edit.** Undeployed code has been found twice: `54ce388` recovered
-> five changes deployed 2026-07-21, and `4267f39` recovered a subject-fallback fix deployed
-> 2026-07-28 — the second was caught only because the bundle was re-diffed minutes before an
-> unrelated push that would have reverted it. Deploy from `main`, and verify first:
+> **Check this before you edit.** Undeployed code has been found three times: `54ce388` recovered
+> five changes deployed 2026-07-21, `4267f39` recovered a subject-fallback fix deployed
+> 2026-07-28, and `9f8bcdf` recovered the supervisor-assist feature deployed 2026-08-25 —
+> which had itself reverted work that was already on `main`. Deploying from anywhere but
+> `main` loses someone's changes. Verify first:
 >
 > ```
 > npx wrangler deploy --dry-run --outdir=/tmp/b
@@ -98,6 +101,24 @@ Until 2026-07-28 the `desk_dropped` case did not exist, and the `desk_dispatch` 
 required `deskTicketPayload` to be non-null — which no pre-dispatch bail-out ever satisfies.
 That is why the Warranty queue dropped 11 calls across five days with alerting switched on.
 
+### Supervisor assist
+
+`POST` or `GET /zoom/supervisorassist` — an agent asks for help mid-engagement and an
+enriched summary is posted to a separate supervisor Zoom chat. Gated by `ZOOM_API_KEY` like
+the other `/zoom/*` routes.
+
+- Engagement id accepted from the query string or a JSON body, under `e`, `engagement_id`,
+  `engagementId`, `engagement`, or `id`. Optional `reason` and `requested_by` (each with
+  aliases). Missing id → 400 listing what it accepts.
+- Path match is lowercased and trailing-slash tolerant, so `/zoom/SupervisorAssist/` works.
+- Enrichment is best-effort — a failed Zoom fetch or Zoho lookup still posts, with a
+  `(engagement lookup failed: ...)` line appended.
+- Deduped per engagement in KV: `supervisor_assist:<id>`, TTL from
+  `SUPERVISOR_ASSIST_DEDUPE_SECONDS` (default 900s). A repeat returns
+  `{ok:true, sent:false, duplicate:true}`.
+- Posts via the shared `postZoomChat()` helper. Needs `SUPERVISOR_WEBHOOK_URL`
+  (503 without it) and optionally `SUPERVISOR_WEBHOOK_SECRET`. Chat post failure → 502.
+
 ### Agent popup at `/popup?phone=<ANI>&engagement_id=<id>`
 
 - Contact match by phone → 302 to `/tab/Contacts/<id>`
@@ -163,6 +184,8 @@ Set via `wrangler secret put <NAME>`, never committed:
 - `ALERT_ZOOM_WEBHOOK_URL`, `ALERT_ZOOM_WEBHOOK_SECRET` — Zoom chat alert channel
 - `ALERT_RESEND_API_KEY`, `ALERT_EMAIL_TO`, `ALERT_EMAIL_FROM` — email alert channel
 - `ALERT_COOLDOWN_SECONDS` — optional, defaults to 3600
+- `SUPERVISOR_WEBHOOK_URL`, `SUPERVISOR_WEBHOOK_SECRET` — supervisor-assist Zoom chat
+- `SUPERVISOR_ASSIST_DEDUPE_SECONDS` — optional, defaults to 900
 
 Not set, but referenced in code: `ZOHO_DESK_DEFAULT_DEPARTMENT_ID` (see department routing above).
 
@@ -240,16 +263,33 @@ error field — filter out `intentionally skipped` before counting failures.
 
 ## Possible follow-ups (none blocking)
 
-1. **Set `ZOHO_DESK_DEFAULT_DEPARTMENT_ID`** — so an unrecognized queue lands somewhere a
+1. **Chat engagements are dropped silently, and no alert covers it.** The entire Desk-ticket
+   block in `processEngagementWebhook` is nested inside `if (callerPhone)`, and `callerPhone`
+   comes from `consumers[0].consumer_number` — which chat engagements don't have. So a chat
+   disposition sets no `desk_ticket_error`, builds no payload, creates no ticket, and never
+   sets `deskDroppedReason`, meaning even the `desk_dropped` alert can't fire. The KV record
+   is the only trace and it looks like a success apart from a null ticket id.
+
+   Seen on the **Customer Service Messaging** queue
+   (`ZWQ900406F09AC9706C98819241120DFEB5`, `channel_types: ["chat"]`): two engagements on
+   2026-08-27 (`066UYqbRS0qRNbsUj9ZoBw` disposition `Internal`, `-CeObgneRUituUl3xYbGbw`
+   disposition `Customer Service`).
+
+   Two decisions needed: should chat engagements create Desk tickets at all, and if so what
+   identifies the contact in place of a phone number. Note both dispositions above are Tech
+   Support picklist values on a queue whose name matches "customer", so even once the phone
+   guard is handled the Inquiry Type mapping would fail for them.
+
+2. **Set `ZOHO_DESK_DEFAULT_DEPARTMENT_ID`** — so an unrecognized queue lands somewhere a
    human will see instead of failing closed. The `desk_dropped` alert now catches this case,
    but the call still produces no ticket.
-2. **Trailing-slash footgun on the webhook catcher** — `catcherPaths` accepts
+3. **Trailing-slash footgun on the webhook catcher** — `catcherPaths` accepts
    `/zoom/webhooks` and `/zoom/webhooks/` but only `/zoom/engagement-webhook` without a
    trailing slash. A POST to `/zoom/engagement-webhook/` falls through to the api-key gate
    and returns 401 with no log line at all. Worth normalizing.
-3. **Durable logs** — a Tail Worker or Logpush would keep the console output that currently
+4. **Durable logs** — a Tail Worker or Logpush would keep the console output that currently
    vanishes unless someone is holding a `wrangler tail` open.
-4. **`cx_engagement_end_data_ready` cleanup** — that older event is no longer the trigger; the route still matches it harmlessly and can be removed if cleaning up
-5. **Lead dedup by phone** — leads currently can duplicate; popup form is fine with that, but could add a check if the customer prefers
-6. **Disposition → Desk classification** — if reporting wants this in a first-class field rather than the cf_inquiry_type custom field, requires Desk classification config + a translation map
-7. **Recording / transcript ingestion** — Zoom CC has scopes for these (`contact_center:read:list_recordings:admin`, etc.); not currently granted
+5. **`cx_engagement_end_data_ready` cleanup** — that older event is no longer the trigger; the route still matches it harmlessly and can be removed if cleaning up
+6. **Lead dedup by phone** — leads currently can duplicate; popup form is fine with that, but could add a check if the customer prefers
+7. **Disposition → Desk classification** — if reporting wants this in a first-class field rather than the cf_inquiry_type custom field, requires Desk classification config + a translation map
+8. **Recording / transcript ingestion** — Zoom CC has scopes for these (`contact_center:read:list_recordings:admin`, etc.); not currently granted
