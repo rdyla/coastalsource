@@ -21,11 +21,14 @@ async function main () {
     // 1. Email collected pre-chat. Read it BEFORE anything writes to it.
     var email = vars["crm_email"] || vars["global_custom.Custom.crm_email"] || "";
 
-    // 2. Engagement id. The variable name differs between orgs, so try the
-    //    known spellings first and otherwise discover it: scan every variable
+    // 2. Engagement id. global_system.Engagement.engagementId is the name for
+    //    this org (note the lower-case leading "e" — that casing is why the
+    //    first attempt came through empty). The other spellings and the scan
+    //    below are kept as a safety net: scan every variable
     //    whose name mentions "engagement" for a value shaped like a Zoom
     //    engagement id (22-ish chars of base64url, e.g. 066UYqbRS0qRNbsUj9ZoBw).
     var engagementId =
+      vars["global_system.Engagement.engagementId"] ||   // confirmed for this org
       vars["global_system.Engagement.EngagementID"] ||
       vars["global_system.Engagement.EngagementId"] ||
       vars["global_system.Engagement.ID"] ||
