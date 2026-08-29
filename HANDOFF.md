@@ -1,20 +1,33 @@
 # Handoff — pick-up notes
 
-Last touched 2026-08-28 via commit `9f8bcdf`.
+Last touched 2026-08-28 via commit `7327073`.
 
-> **Deploy state:** as of 2026-08-28 the repo is AHEAD of production. `main` has the
-> `desk_dropped` alerting from `0021bd8`; the running version does not, because the
-> 2026-08-25 deploy was built from a base predating it and reverted it. Deploy from `main`
-> to restore it.
+> **Deploy state:** repo and production verified in sync on 2026-08-28.
 >
-> **Check this before you edit.** Undeployed code has been found three times: `54ce388` recovered
-> five changes deployed 2026-07-21, `4267f39` recovered a subject-fallback fix deployed
-> 2026-07-28, and `9f8bcdf` recovered the supervisor-assist feature deployed 2026-08-25 —
-> which had itself reverted work that was already on `main`. Deploying from anywhere but
-> `main` loses someone's changes. Verify first:
+> **A guard now enforces this.** `scripts/predeploy.mjs` runs as wrangler's `[build]`
+> command and refuses to build unless HEAD is on `main`, the tree is clean, and it matches
+> `origin/main` exactly after a fetch. Being *ahead* fails too — unpushed commits mean
+> production is the only copy. Each refusal names the offending files or commits and the
+> command that fixes it.
+>
+> Because it hooks the build, it also runs on `wrangler dev` and `--dry-run`. Bypass with
+> `PREDEPLOY_SKIP=1`, which you need to dry-run a dirty tree:
 >
 > ```
-> npx wrangler deploy --dry-run --outdir=/tmp/b
+> PREDEPLOY_SKIP=1 npx wrangler deploy --dry-run --outdir=/tmp/b
+> ```
+>
+> **Why it exists.** Undeployed code has been found three times: `54ce388` recovered five
+> changes deployed 2026-07-21, `4267f39` a subject-fallback fix deployed 2026-07-28, and
+> `9f8bcdf` the supervisor-assist feature deployed 2026-08-25 — which had itself reverted
+> the `desk_dropped` alerting already on `main`, because it was deployed from a checkout
+> behind origin. `git status` was clean on both machines; only diffing the deployed bundle
+> caught it.
+>
+> **To diff production against local by hand:**
+>
+> ```
+> PREDEPLOY_SKIP=1 npx wrangler deploy --dry-run --outdir=/tmp/b
 > curl -H "Authorization: Bearer $(grep -m1 '^oauth_token' \
 >   ~/Library/Preferences/.wrangler/config/default.toml | sed 's/.*= *"//;s/"$//')" \
 >   "https://api.cloudflare.com/client/v4/accounts/521c322a89a17bb69f91f1e65177606e/workers/scripts/coastalsource/content/v2" \
