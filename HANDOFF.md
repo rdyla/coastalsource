@@ -309,42 +309,40 @@ error field — filter out `intentionally skipped` before counting failures.
   received (email + Zoom chat). Re-run that endpoint after rotating `ALERT_RESEND_API_KEY` or
   changing `ALERT_ZOOM_WEBHOOK_URL` — a dead channel throws, gets logged, and is then
   swallowed by `Promise.allSettled`, so nothing else will tell you.
+- **Chat engagements create Desk cases** — verified end to end 2026-08-29 on the
+  `Customer Service Messaging` queue, both paths:
+  - unknown address (`art@vandelay.com`) → case `570884000034925252`, new inline contact
+  - known address (`sadie.cassidy@hotmail.com`) → case `570884000034960007`, linked to the
+    existing Desk contact `570884000031111633` *and* account `570884000008262235`
+
+  Both `channel: "Chat"`, correct CS department, correct `cf_inquiry_type_2`, phone omitted,
+  and the wrap-up re-fetch (`0 -> 1`) worked as it does for voice. The queue's dispositions
+  were corrected on the Zoom side the same day.
 - **Backfill of the 11 Warranty calls** dropped between 2026-07-23 and 2026-07-28 — completed
   2026-07-28 via a temporary `POST /admin/backfill` endpoint (since removed, never committed).
   Confirmed complete.
 
 ## Possible follow-ups (none blocking)
 
-1. **Chat tickets — worker side is done, two Zoom-side changes remain.** As of 2026-08-29
-   the worker will open a Desk ticket for a chat engagement as soon as the flow posts an
-   email (or phone) to `/zoom/chat-identity`. Nothing further is needed here. Outstanding:
-
-   a. **Add the HTTP Request widget** to the `Customer Service WebChat` flow
-      (`hbHFsRuzRo6PkHq_y9dh6Q`) so it posts the collected identity to
-      `/zoom/chat-identity`. That one call also returns the Zoho match for screen pop, so
-      no second lookup call is needed. If the flow isn't collecting name/email yet, enable
-      pre-chat capture first.
-
-   b. **Fix the queue's dispositions.** `Customer Service Messaging` is meant to carry the
-      same set as the CS voice queue and the worker already routes it that way, but it is
-      configured in Zoom with Tech Support values (`Internal`, `Customer Service`) which
-      have no CS mapping — so a chat would still drop at the Inquiry Type step even with
-      identity solved.
-
-   Until both are done, chat engagements record `no_caller_identity` and alert rather than
-   creating tickets. Chat is low volume so far: 2 of 155 engagements in the 08-24..08-28
-   window.
-
-2. **Set `ZOHO_DESK_DEFAULT_DEPARTMENT_ID`** — so an unrecognized queue lands somewhere a
+1. **Set `ZOHO_DESK_DEFAULT_DEPARTMENT_ID`** — so an unrecognized queue lands somewhere a
    human will see instead of failing closed. The `desk_dropped` alert now catches this case,
    but the call still produces no ticket.
-3. **Trailing-slash footgun on the webhook catcher** — `catcherPaths` accepts
+2. **Trailing-slash footgun on the webhook catcher** — `catcherPaths` accepts
    `/zoom/webhooks` and `/zoom/webhooks/` but only `/zoom/engagement-webhook` without a
    trailing slash. A POST to `/zoom/engagement-webhook/` falls through to the api-key gate
    and returns 401 with no log line at all. Worth normalizing.
-4. **Durable logs** — a Tail Worker or Logpush would keep the console output that currently
+3. **Durable logs** — a Tail Worker or Logpush would keep the console output that currently
    vanishes unless someone is holding a `wrangler tail` open.
-5. **`cx_engagement_end_data_ready` cleanup** — that older event is no longer the trigger; the route still matches it harmlessly and can be removed if cleaning up
-6. **Lead dedup by phone** — leads currently can duplicate; popup form is fine with that, but could add a check if the customer prefers
-7. **Disposition → Desk classification** — if reporting wants this in a first-class field rather than the cf_inquiry_type custom field, requires Desk classification config + a translation map
-8. **Recording / transcript ingestion** — Zoom CC has scopes for these (`contact_center:read:list_recordings:admin`, etc.); not currently granted
+4. **Send a name on chat captures** — the flow currently posts only `email`, so a chat from
+   an address with no Zoho match produces a contact called "Unknown Chat Visitor" (see case
+   `570884000034925252`). `/zoom/chat-identity` already accepts `name`, `first_name` and
+   `last_name`; adding `&name=` to the flow's URL is a one-line change and names those
+   contacts properly. Known addresses are unaffected — the CRM lookup supplies the name.
+5. **Confirm assignee resolution for chat** — the verification cases came from the "Packet
+   Fusion" test login and got no `assigneeId`. The voice path maps a Zoom agent to a Desk
+   agent by email, so this is probably just the test account, but it is worth confirming
+   with a real agent before assuming chat cases route correctly.
+6. **`cx_engagement_end_data_ready` cleanup** — that older event is no longer the trigger; the route still matches it harmlessly and can be removed if cleaning up
+7. **Lead dedup by phone** — leads currently can duplicate; popup form is fine with that, but could add a check if the customer prefers
+8. **Disposition → Desk classification** — if reporting wants this in a first-class field rather than the cf_inquiry_type custom field, requires Desk classification config + a translation map
+9. **Recording / transcript ingestion** — Zoom CC has scopes for these (`contact_center:read:list_recordings:admin`, etc.); not currently granted
