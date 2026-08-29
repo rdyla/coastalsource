@@ -21,8 +21,10 @@ async function main () {
     // 1. Email collected pre-chat. Read it BEFORE anything writes to it.
     var email = vars["crm_email"] || vars["global_custom.Custom.crm_email"] || "";
 
-    // 2. Engagement id. Confirm the exact name for your org — if none of these
-    //    resolve, the log line below prints every variable that is available.
+    // 2. Engagement id. The variable name differs between orgs, so try the
+    //    known spellings first and otherwise discover it: scan every variable
+    //    whose name mentions "engagement" for a value shaped like a Zoom
+    //    engagement id (22-ish chars of base64url, e.g. 066UYqbRS0qRNbsUj9ZoBw).
     var engagementId =
       vars["global_system.Engagement.EngagementID"] ||
       vars["global_system.Engagement.EngagementId"] ||
@@ -31,7 +33,24 @@ async function main () {
       "";
 
     if (!engagementId) {
-      log.error("No engagement id found. Available vars: " + JSON.stringify(Object.keys(vars)));
+      var idLike = /^[A-Za-z0-9_-]{18,26}$/;
+      var keys = Object.keys(vars);
+      for (var i = 0; i < keys.length; i++) {
+        var k = keys[i];
+        if (!/engagement/i.test(k)) continue;
+        if (/ANI|DNIS|queue|flow|channel|direction/i.test(k)) continue;
+        var v = vars[k];
+        if (typeof v === "string" && idLike.test(v)) {
+          engagementId = v;
+          log.info("Engagement id discovered in variable: " + k);
+          break;
+        }
+      }
+    }
+
+    if (!engagementId) {
+      // Nothing matched — dump names AND values so the right one is obvious.
+      log.error("No engagement id found. Variables: " + JSON.stringify(vars));
     }
     if (!email) {
       log.error("No crm_email set — pre-chat capture did not populate it.");
