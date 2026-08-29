@@ -150,6 +150,9 @@ and `/recordings` are 401 on scope; the other sub-paths 400. Hence push, not pul
 - Stored at `chat_identity:<engagement_id>`, TTL `CHAT_IDENTITY_TTL_SECONDS` (default 24h —
   short because it is customer PII and the disposition normally lands within minutes).
 - 400 with the accepted field names if the id or all identity fields are missing.
+- Also resolves the identity against Zoho and returns the match inline as `lookup`, so one
+  widget call both captures for ticket creation and returns screen-pop data. Best-effort —
+  a failure lands in `lookup_error` and never loses the capture. `lookup=false` skips it.
 
 At disposition time, an engagement with no `consumer_number` looks this up. With an email it
 resolves a Desk contact by email (or creates one inline with the email attached) and opens a
@@ -270,6 +273,8 @@ All `GET`, require `x-api-key: <ZOOM_API_KEY>`:
 - `/zoom/webhooks/recent` — last 20 captured webhook payloads
 - `/zoom/webhooks/<id>` — fetch a specific payload
 - `/zoho/lookup-by-phone?phone=+1...` — Zoho phone lookup used by popup + webhook
+- `/zoho/lookup-by-email?email=...` — same shape, searches Contacts on Email then
+  Secondary_Email; used by the chat path
 - `/zoho/desk/agents?email=...` — probe Desk agents endpoint, optionally filter by email
 - `/zoom/engagement/<id>` — raw Zoom engagement
 - `/zoom/engagement/<id>/probe` — hits several Zoom sub-paths to discover what data is exposed
@@ -315,8 +320,10 @@ error field — filter out `intentionally skipped` before counting failures.
    email (or phone) to `/zoom/chat-identity`. Nothing further is needed here. Outstanding:
 
    a. **Add the HTTP Request widget** to the `Customer Service WebChat` flow
-      (`hbHFsRuzRo6PkHq_y9dh6Q`) so it posts the collected identity. If the flow isn't
-      collecting name/email yet, enable pre-chat capture first.
+      (`hbHFsRuzRo6PkHq_y9dh6Q`) so it posts the collected identity to
+      `/zoom/chat-identity`. That one call also returns the Zoho match for screen pop, so
+      no second lookup call is needed. If the flow isn't collecting name/email yet, enable
+      pre-chat capture first.
 
    b. **Fix the queue's dispositions.** `Customer Service Messaging` is meant to carry the
       same set as the CS voice queue and the worker already routes it that way, but it is
