@@ -700,6 +700,9 @@ async function handleChatIdentity(request, env, url) {
     }
   }
 
+  // Spread the lookup at the top level as well as nesting it, so a flow script
+  // can read data.found / data.contact / data.account exactly as it does from
+  // /zoho/lookup-by-phone. No key collides with the capture fields.
   return json({
     ok: true,
     stored: true,
@@ -710,6 +713,7 @@ async function handleChatIdentity(request, env, url) {
       name: Boolean(name || firstName || lastName),
     },
     expires_in_seconds: ttl,
+    ...(lookup || { found: false, match_type: null, contact: null, account: null }),
     lookup,
     lookup_error: lookupError,
   });
