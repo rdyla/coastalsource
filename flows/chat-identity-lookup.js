@@ -13,6 +13,18 @@
 //
 // The response is deliberately the same shape as /zoho/lookup-by-phone, so the
 // variable mapping below is unchanged from the voice script.
+//
+// 2026-09-17: the API key now comes from the flow variable
+// global_custom.Custom.x-api-key instead of being hardcoded. NEVER paste the
+// key back into this file — it is a public repo and the previously committed
+// key had to be rotated because of it.
+//
+// NOTE: unlike the voice script, the contact variables below are still written
+// bare (crm_name) rather than global_custom.Custom.-prefixed. On voice, bare
+// names never reached the screen pop and the caller's name showed blank. That
+// has not been re-tested for chat — case creation works either way because it
+// depends on the worker storing identity, not on these variables. Worth
+// checking whether the chat screen pop actually shows crm_name.
 
 async function main () {
   try {
@@ -75,6 +87,13 @@ async function main () {
       return;
     }
 
+    // API key from a flow variable. Pull it into a local first so a missing or
+    // misnamed variable fails with a clear message instead of a confusing 401.
+    var apiKey = vars["global_custom.Custom.x-api-key"];
+    if (!apiKey) {
+      throw new Error("api key variable is empty - check the custom variable name");
+    }
+
     // 3. Capture + lookup in one call. GET is used so no req.post is needed.
     var url = "https://coastalsource.itcontact-521.workers.dev/zoom/chat-identity"
       + "?e=" + encodeURIComponent(engagementId)
@@ -82,7 +101,7 @@ async function main () {
 
     var response = await req.get(url, {
       headers: {
-        "x-api-key": "gg7UDcZwRWG_SzdggJrPIayoKdYdJAmTy7pATtjL7f4"
+        "x-api-key": apiKey
       }
     });
 

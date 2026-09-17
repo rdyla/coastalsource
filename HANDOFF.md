@@ -245,6 +245,26 @@ the current value; `wrangler secret put` cannot read it back, so keep it in the 
 manager. Note `wrangler secret put` creates a new Worker version but reuses the deployed
 script — it will not push local code.
 
+### `ZOOM_API_KEY` in the flow scripts — do not hardcode it
+
+The flow scripts in [flows/](flows/) read the key from the flow variable
+`global_custom.Custom.x-api-key`, set in the Variable widget. It used to be pasted inline.
+
+**This repo is public.** Commit `cfb806f` (2026-08-28) committed the live `ZOOM_API_KEY`
+into both flow scripts, where it stayed until 2026-09-17. That key must be treated as
+compromised: it gates `/zoho/lookup-by-phone` and `/zoom/webhooks/recent`, which return
+customer names, emails and phone numbers to anyone holding it.
+
+Removing it from the working tree does not remove it from history — `cfb806f` still
+contains it, and GitHub retains unreachable commits. Rotating the key is the only thing
+that actually revokes access. Either scrub the history (`git filter-repo` / BFG plus a
+coordinated force-push) or make the repo private, but do the rotation first.
+
+Also note `wrangler secret put` refuses to run whenever an undeployed version exists —
+and adding a secret from the Cloudflare dashboard creates exactly that. If you see
+"the latest version of your Worker isn't currently deployed", run `wrangler deploy`
+first, then `secret put`.
+
 ## Current Zoho OAuth scopes
 
 Re-auth with this exact list if a refresh is ever needed:
