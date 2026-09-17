@@ -13,18 +13,6 @@
 //
 // The response is deliberately the same shape as /zoho/lookup-by-phone, so the
 // variable mapping below is unchanged from the voice script.
-//
-// 2026-09-17: the API key now comes from the flow variable
-// global_custom.Custom.x-api-key instead of being hardcoded. NEVER paste the
-// key back into this file — it is a public repo and the previously committed
-// key had to be rotated because of it.
-//
-// NOTE: unlike the voice script, the contact variables below are still written
-// bare (crm_name) rather than global_custom.Custom.-prefixed. On voice, bare
-// names never reached the screen pop and the caller's name showed blank. That
-// has not been re-tested for chat — case creation works either way because it
-// depends on the worker storing identity, not on these variables. Worth
-// checking whether the chat screen pop actually shows crm_name.
 
 async function main () {
   try {
@@ -33,52 +21,13 @@ async function main () {
     // 1. Email collected pre-chat. Read it BEFORE anything writes to it.
     var email = vars["crm_email"] || vars["global_custom.Custom.crm_email"] || "";
 
-    // 2. Engagement id. global_system.Engagement.engagementId is the name for
-    //    this org, but if var_get() does not expose system variables at this
-    //    point in the flow it will read as empty regardless of the name being
-    //    right. The reliable fix is to copy it into a custom variable in the
-    //    Variable widget that already runs at the start of this flow:
-    //
-    //        global_custom.Custom.engagement_id = global_system.Engagement.engagementId
-    //
-    //    That is checked first below. The system spellings and the scan are
-    //    kept as a safety net: scan every variable
-    //    whose name mentions "engagement" for a value shaped like a Zoom
-    //    engagement id (22-ish chars of base64url, e.g. 066UYqbRS0qRNbsUj9ZoBw).
+    // 2. Engagement id. Confirm the exact name for your org — if none of these
+    //    resolve, the log line below prints every variable that is available.
     var engagementId =
-      // Set by the Variable widget — see note above. Checked first because it
-      // works regardless of whether var_get() exposes system variables here.
-      vars["global_custom.Custom.engagement_id"] ||
-      vars["engagement_id"] ||
-      vars["global_system.Engagement.engagementId"] ||   // confirmed name for this org
-      vars["global_system.Engagement.EngagementID"] ||
-      vars["global_system.Engagement.EngagementId"] ||
-      vars["global_system.Engagement.ID"] ||
-      vars["global_system.Engagement.engagement_id"] ||
-      "";
+      vars["global_system.Engagement.engagementId"] || "";
 
     if (!engagementId) {
-      var idLike = /^[A-Za-z0-9_-]{18,26}$/;
-      var keys = Object.keys(vars);
-      for (var i = 0; i < keys.length; i++) {
-        var k = keys[i];
-        if (!/engagement/i.test(k)) continue;
-        if (/ANI|DNIS|queue|flow|channel|direction/i.test(k)) continue;
-        var v = vars[k];
-        if (typeof v === "string" && idLike.test(v)) {
-          engagementId = v;
-          log.info("Engagement id discovered in variable: " + k);
-          break;
-        }
-      }
-    }
-
-    if (!engagementId) {
-      // Nothing matched — dump names AND values so the right one is obvious.
-      // If global_system.* names are absent from this dump entirely, var_get()
-      // is not exposing system variables here: set
-      // global_custom.Custom.engagement_id in the Variable widget instead.
-      log.error("No engagement id found. Variables: " + JSON.stringify(vars));
+      log.error("No engagement id found. Available vars: " + JSON.stringify(Object.keys(vars)));
     }
     if (!email) {
       log.error("No crm_email set — pre-chat capture did not populate it.");
@@ -87,18 +36,15 @@ async function main () {
       return;
     }
 
-    // API key from a flow variable. Pull it into a local first so a missing or
-    // misnamed variable fails with a clear message instead of a confusing 401.
-    var apiKey = vars["global_custom.Custom.x-api-key"];
-    if (!apiKey) {
-      throw new Error("api key variable is empty - check the custom variable name");
-    }
-
     // 3. Capture + lookup in one call. GET is used so no req.post is needed.
     var url = "https://coastalsource.itcontact-521.workers.dev/zoom/chat-identity"
       + "?e=" + encodeURIComponent(engagementId)
       + "&email=" + encodeURIComponent(email);
 
+    var apiKey = var_get()["global_custom.Custom.x-api-key"];
+    if (!apiKey) {
+      throw new Error("api key variable is empty - check the custom variable name");
+    }
     var response = await req.get(url, {
       headers: {
         "x-api-key": apiKey

@@ -1,27 +1,13 @@
-// Zoom CC flow script — voice queues (ANI lookup).
-//
-// Flow scripts live only in the Zoom flow designer, so like the worker they
-// have no version history unless kept here; see HANDOFF's deploy-state note
-// for why that matters on this project.
-//
-// Two things changed on 2026-09-17:
-//
-//  1. The API key is read from a flow variable instead of being hardcoded.
-//     Set global_custom.Custom.x-api-key in the Variable widget to the current
-//     ZOOM_API_KEY. NEVER paste the key back into this file — it is a public
-//     repo and the previously committed key had to be rotated because of it.
-//  2. Contact variables are written with the global_custom.Custom. prefix.
-//     They used to be written bare (crm_name), which is why agents saw the
-//     company but never the caller's name: bare names don't land in the
-//     namespace the screen pop reads. Confirmed fixed in production.
-
 async function main () {
   try {
     // 1. Get caller phone
     var phone = var_get()["global_system.Engagement.ANI"];
+    //var phone = "7276870055";
+    //var phone = "7146555375";
 
-    // API key from a flow variable. Pull it into a local first so a missing or
-    // misnamed variable fails with a clear message instead of a confusing 401.
+    // API key comes from a flow variable now, not hardcoded. Pull it into a
+    // local first so a missing/misnamed variable fails with a clear message
+    // instead of a confusing 401 from the worker.
     var apiKey = var_get()["global_custom.Custom.x-api-key"];
     if (!apiKey) {
       throw new Error("api key variable is empty - check the custom variable name");
@@ -56,6 +42,7 @@ async function main () {
 
       // ACCOUNT
       if (data.account) {
+        //global_var_set("global_custom.Custom.crm_sap_id", data.account.sap_id || "");
         global_var_set("global_custom.Custom.crm_compass_id", data.account.compass_id || "");
         global_var_set("global_custom.Custom.crm_account_name", data.account.account_name || "");
         global_var_set("global_custom.Custom.crm_account_type", data.account.account_type || "");
